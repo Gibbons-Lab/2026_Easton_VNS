@@ -1,0 +1,366 @@
+---
+title: "cytokine_plot_final.Rmd"
+author: "Alyssa N. Easton"
+date:   '2026-05-05'
+output: 
+---
+
+# Setup
+```{r "setup", include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache=TRUE)
+knitr::opts_knit$set(root.dir = file.path(Sys.getenv("VNS_ROOT"), "data"))  # stored VNS_ROOT in ~/.Renviron
+options(expressions = 6000)  # Increase allowed recursion depth
+options(digits = 10) ## Formats output to 10 digits
+library(magrittr)
+library(tidyverse)
+library(purrr)
+library(rlang)
+library(broom)
+library(broom.helpers)
+library(glue)
+library(janitor)
+library(openxlsx)
+library(patchwork)
+library(cowplot)
+library(grid)
+library(gtable)
+library(gridExtra)
+library(ggtext)
+library(ggh4x)
+library(ComplexHeatmap)
+library(Cairo)
+library(RColorBrewer)
+library(circlize)
+library(ggsignif)
+library(emmeans)
+library(ggpubr) # stat_pvals_manual
+
+source("../scripts/mdact.R")
+source("../scripts/june_functions.R")
+source("/proj/gibbons/2024_easton_vns/workflow/functions/shannon_div_functions.R")
+source("/proj/gibbons/2024_easton_vns/scripts/shannon_div_functions.R")
+source("/proj/gibbons/2024_easton_vns/workflow/functions/final_form_functions.R")
+```
+
+Load data once
+```{r}
+data <- readRDS("/proj/gibbons/2024_easton_vns/data/1_preprocessed/species_october.rds")
+lmer <- readRDS("/proj/gibbons/2024_easton_vns/data/lmer/all_diffabund_new.rds")
+pca <- readRDS("/proj/gibbons/2024_easton_vns/data/PCA/pca_A_cytokines.rds")
+
+naming_df <- pca$loadings[, 1] %>% # Feature = original name in data (e.g. "brain_IL-6")
+  mutate("loc_cyto" = Feature) %>% # loc_cyto = ... same
+  separate(col = Feature, sep = "_", into = c("location", "cytokine"), extra = "merge") %>%
+  mutate(
+    clean_loc_cyto = make_clean_names(loc_cyto),
+    symbol_name = cytokine %>% gsub("-1a", "-1α", .) %>% gsub("INF_gamma", "IFN-γ", .)
+    )
+
+pc_load_df <- pca$loadings[, 1:6] %>%
+  mutate(clean_loc_cyto = naming_df$clean_loc_cyto[match(Feature, naming_df$loc_cyto)]) %>%
+  column_to_rownames("clean_loc_cyto") %>%
+  dplyr::select(-Feature)
+
+# rownames(pc_load_mat) == naming_df$clean_loc_cyto
+# I think I can just use naming_df
+# ann_mat <- data.frame(
+#   "loc_cyto" = rownames(pc_load_mat),  # raw names in data (e.g. "brain_IL-6")
+#   "Feature"  = rownames(pc_load_mat)
+#   ) %>%
+#   separate(col = Feature, sep = "_", into = c("location", "cytokine"), extra = "merge")
+
+cyto_cols <- rownames(pc_load_df) # not in any particular order yet
+
+raw_cyto_data <- as.data.frame(data$a_meta) %>%  # was wide_cyto_df
+  dplyr::select(all_of(c("seq_name", "inj_trt_group", "Injury", "Treatment", naming_df$loc_cyto))) %>%
+  rename_with(~ naming_df$clean_loc_cyto[match(., naming_df$loc_cyto)], .cols = naming_df$loc_cyto)
+  # %>% mutate(across(all_of(cyto_cols), ~ . %>% scale())) # don't scale
+
+scaled_cyto_data <- as.data.frame(data$a_meta) %>%  # was wide_cyto_df
+  dplyr::select(all_of(c("seq_name", "inj_trt_group", "Injury", "Treatment", naming_df$loc_cyto))) %>%
+  rename_with(~ naming_df$clean_loc_cyto[match(., naming_df$loc_cyto)], .cols = naming_df$loc_cyto) %>%
+  mutate(across(all_of(cyto_cols), ~ . %>% scale()))
+
+raw_cyto_summary <- raw_cyto_data %>%
+  pivot_longer(-c(seq_name, inj_trt_group, Injury, Treatment), names_to = "clean_loc_cyto") %>%
+  group_by(inj_trt_group, Injury, Treatment, clean_loc_cyto) %>%
+  summarise(
+    mean = mean(value, na.rm = TRUE),
+    se   = sd(value, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  )
+
+scaled_cyto_summary <- scaled_cyto_data %>%
+  pivot_longer(-c(seq_name, inj_trt_group, Injury, Treatment), names_to = "clean_loc_cyto") %>%
+  group_by(inj_trt_group, Injury, Treatment, clean_loc_cyto) %>%
+  summarise(
+    mean = mean(value, na.rm = TRUE),
+    se   = sd(value, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  )
+```
+
+## PCA Heat Map
+Cluster matrix rows first so we know what order
+```{r}
+pc_load_mat <- as.matrix(pc_load_df)
+
+ann_mat <- data.frame("clean_loc_cyto" = rownames(pc_load_mat)) %>%
+  left_join(naming_df, by = "clean_loc_cyto")
+
+ck_color <- colorRamp2(  # formerly col_fun
+  seq(-max(abs(pc_load_mat), na.rm = TRUE), max(abs(pc_load_mat), na.rm = TRUE), length.out = 11),
+  rev(RColorBrewer::brewer.pal(11, "BrBG"))
+)
+
+location_colors <- c(
+  "serum" = "#990000",
+  "brain" = "#FFCCCC"
+)
+
+# injtrt_shapes <- c(
+#   "Sham + Sham"  = 23,
+#   "Blast + Sham" = ,
+#   "Sham + VNS"   = ,
+#   "Blast + VNS"  = ,
+# )
+
+
+# Create annotation
+loc_ann <- rowAnnotation(
+  "Sample\nLocation" = ann_mat$location,
+  col = list("Sample\nLocation" = location_colors),
+  show_annotation_name = FALSE,
+  simple_anno_size = unit(0.2, "cm")
+)
+
+# create heatmap with annotation
+plt <- Heatmap(
+    matrix             = pc_load_mat,
+    name               = "PC weight",
+    left_annotation    = loc_ann,
+    
+    column_title       = "Principal Component",
+    col                = ck_color,
+    cluster_columns    = FALSE,
+    column_order       = rev(colnames(pc_load_mat)),
+    show_column_names  = TRUE,
+    column_labels      = gsub("PC", "", colnames(pc_load_mat)),
+    column_names_gp    = gpar(fontsize = 14),
+    column_names_side  = "top",
+    column_names_rot   = 0, 
+    show_column_dend   = FALSE,
+    
+    row_split          = ann_mat$location, 
+    cluster_rows       = TRUE,
+    cluster_row_slices = TRUE,
+    show_row_names     = TRUE,
+    row_labels         = rownames(pc_load_mat) %>% gsub("serum_", "", .) %>% gsub("brain_", "", .),
+    show_row_dend      = FALSE,
+    
+    height             = unit(nrow(pc_load_mat)*.75, "cm"),
+    width              = unit(ncol(pc_load_mat)*.75, "cm")
+  )
+```
+
+```{r}
+cairo_pdf("../figures/cytokine_loading_heatmap_3.pdf", width = 8, height = 12)
+
+heat_plot <- draw(plt)
+row_ord <- c(unlist(row_order(heat_plot)))
+clean_cyto_order <- rownames(pc_load_mat)[row_ord]
+
+dev.off()
+```
+
+```{r}
+colnames(cyto_summary)
+```
+
+## Summary Plot
+```{r}
+scaled_cyto_summary <- scaled_cyto_summary %>%
+  mutate(
+    clean_loc_fct = factor(clean_loc_cyto, levels = clean_cyto_order),
+    inj_trt_rev = fct_relevel(inj_trt_group, "Blast + VNS", "Sham + VNS", "Blast + Sham", "Sham + Sham")
+    )
+
+raw_cyto_summary <- raw_cyto_summary %>%
+  mutate(clean_loc_fct = factor(clean_loc_cyto, levels = clean_cyto_order))
+```
+
+```{r}
+# Define alternating shading bands
+cyto_bands <- scaled_cyto_summary %>%
+  distinct(inj_trt_group, clean_loc_fct) %>%
+  group_by(clean_loc_fct) %>% 
+  arrange(by = "clean_loc_fct") %>%
+  mutate(
+    band_id = as.numeric(clean_loc_fct),
+    fill = ifelse(band_id %% 2 == 1, "grey95", "white")
+  ) %>%
+  ungroup()
+
+# Create the wrapper function
+format_ck_labels <- function(clean_cyto) {
+  naming_df$symbol_name[match(clean_cyto, naming_df$clean_loc_cyto)]
+}
+
+naming_df$symbol_name[match("serum_il_5", naming_df$clean_loc_cyto)]
+# output should be `[1] "IL-5"`
+```
+
+HOW TO MAP 'value_column' from df2 into a new column in df1 based on 'id'
+  `df1$new_column <- df2$value_column[match(df1$id, df2$id)]`
+
+```{r, fig.width = 4, fig.height = 10}
+cyto_plot <- ggplot(scaled_cyto_summary, aes(x = mean, y = inj_trt_rev, color = inj_trt_group)) +
+  geom_rect(data = cyto_bands,
+    aes(xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf, fill = fill),
+    inherit.aes = FALSE, color = NA
+  ) +
+  geom_point(size = 1.0) +
+  geom_linerange(aes(xmin = mean - se, xmax = mean + se), linewidth = 0.25) +
+  scale_fill_identity() +
+  # geom_errorbarh(aes(xmin = mean - se, xmax = mean + se), linewidth = 0.3, height = 0.5) +
+  scale_color_manual(values = four_colors) +
+  scale_shape_manual() +
+  facet_grid(
+    rows   = vars(clean_loc_fct),
+    labeller = labeller(clean_loc_fct = as_labeller(format_ck_labels)), # this didn't work
+    space  = "free_y",
+    # scales = "free_y",
+    # switch = "y"            # plot y-labels on left-hand side (instead of right)
+    ) +
+  scale_x_continuous(limits = c(-1.6, 1.6), position = "top") +
+  coord_cartesian(clip = "off") +
+  labs(
+    # x = "Standardized Cytokine\n(Mean ± SEM)",
+    x = NULL,
+    y = NULL
+    ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    strip.placement   = "outside",
+    strip.clip        = "off",
+    strip.text.y.right = element_text(angle = -45, hjust = 0, vjust = 0),
+    panel.spacing.y   = unit(0.1, "lines"),   # try 1-3 "lines" of spacing
+    panel.spacing.x   = unit(0.1, "lines"),   # put close together
+    axis.text.x       = element_text(angle = -90, hjust = 1, vjust = 0, size = 15),
+    axis.text.y       = element_blank(),
+    axis.ticks.y      = element_blank(),
+    axis.ticks.x      = element_line(colour = "black", linewidth = 0.4),
+    axis.line.x       = element_line(colour = "black", linewidth = 0.4),
+    panel.grid        = element_blank(),
+    panel.background  = element_blank(),
+    legend.position   = "none"
+  )
+
+cyto_plot
+ggsave("../figures/cyto_summary_plot_3.pdf", cyto_plot, width = 3, height = 12, device = cairo_pdf)
+```
+
+
+# PCA plots
+```{r}
+pc_df <- pca$meta %>% transmute(seq_name, inj_trt_group, Injury, Treatment, PC1, PC2, PC3, PC4, PC5)
+pc_vec <- c("PC1", "PC2", "PC3", "PC4", "PC5")
+
+pc_varmap <- pca$vars %>%
+  transmute(PC, prop = `Proportion of Variance`) %>%
+  mutate(full_name = paste0(PC, " (", round(x = prop*100, digits = 1), "%)"))
+
+pc_label_df <- pc_varmap %>%
+  transmute(
+    "dv" = PC,
+    "label" = full_name
+  )
+
+# pc_to_name <- setNames(
+#   object = pc_varmap$full_name,
+#   nm     = pc_varmap$PC
+# )
+# pc_to_name[pc_vec]
+```
+
+FINAL PLOTTING 
+```{r}
+pc_plots <- plot_multiple_dv(
+  data = pc_df,
+  dvs = pc_vec,
+  groups = "inj_trt_group",
+  factorA = "Injury",
+  factorB = "Treatment",
+  x_positions = c(4, 10, 20, 26),
+  axis_length = 30,
+  palette = injtrt_pal,
+  label_df = pc_label_df
+) %>%
+  purrr::map(., ~
+  ggdraw(.x) +
+    draw_grob(
+      make_manual_legend(blast_pal),
+      x = -0.10, y = 1.36,
+      hjust = 0, vjust = 1
+    )
+)
+
+```
+
+```{r}
+pc_plots[[1]]
+```
+
+
+```{r}
+
+test_plots <- plot_multiple_dv(
+  data = pc_df,
+  dvs = pc_vec,
+  groups = "inj_trt_group",
+  factorA = "Injury",
+  factorB = "Treatment",
+  x_positions = c(4, 10, 20, 26),
+  axis_length = 30,
+  palette = injtrt_pal,
+  label_df = pc_label_df,
+  italicize = FALSE,
+  ylab_size = 25,
+  show_legend = FALSE,
+  fit_fun = aov,
+  comparison_mode = "reduced",
+  factorA_level_for_factorB = "Blast",
+  return_plots = TRUE
+  ) %>%
+  purrr::map(., ~
+  ggdraw(.x) +
+    draw_grob(
+      make_manual_legend(blast_pal),
+      x = -0.10, y = 1.36,
+      hjust = 0, vjust = 1
+    )
+)
+
+test_plots[[1]]
+```
+
+
+```{r}
+pages <- list(
+  list(
+    title = "Cytokine PCs",
+    plots = test_plots,
+    layout = "grid_paginated",
+    ncol = 3,
+    n_per_page = 6
+  )
+)
+
+save_pages(
+  pages,
+  file = "../figures/cyto_pc_boxes.pdf",
+  width = 15, # 3 * 5
+  height = 12 # 2 * 6
+)
+```
+

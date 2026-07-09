@@ -1,0 +1,319 @@
+---
+title: "01_preprocess.Rmd"
+author: "Alyssa N. Easton"
+date: '2026-05-13'
+output:
+---
+
+Outputs: `data/1_preprocessed/01_preprocess_metadata_cleaned_meta.rds`
+
+```{r "setup", include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache=TRUE)
+knitr::opts_knit$set(root.dir = "/proj/gibbons/2024_easton_vns/data")
+options(digits = 10) ## Formats output to 10 digits
+library(tidyverse)
+library(data.table)
+library(magrittr)
+library(readxl)
+source("/proj/gibbons/2024_easton_vns/workflow/functions/utils.R")
+```
+
+## Prepare Metadata
+```{r read}
+# updated behavior data
+pd_data <- read_xlsx("metadata/VNS_behavior_250314.xlsx") %>%
+  dplyr::select(animal_code, startle_habituation, startle_PPI, PD_choice,
+                EtOH_24h_intakeave, EtOH_pref_24h, EtOH_8pm_intakeave) %>%
+  rename(PD_choice_filt = PD_choice,
+         EtOH_24h_intakeave_final = EtOH_24h_intakeave,
+         EtOH_pref_24h_final = EtOH_pref_24h,
+         EtOH_8pm_intakeave_final = EtOH_8pm_intakeave)
+
+# rest of data
+metadata <- read_xlsx("metadata/VNS_datafinalpaper_240513.xlsx") %>%
+  dplyr::select(where(~ any(!is.na(.)))) %>%           # remove empty cols
+  mutate(animal_code = as.integer(animal_code)) %>%    # convert animal_code to int
+  dplyr::select(-matches("p__|o__")) %>%               # remove old microbiome-related columns
+  dplyr::select(-c(observed, chao1, shannon, PC1, PC2)) %>%
+  left_join(pd_data, by = "animal_code") %>%           # merge in the behavior data
+  mutate(
+    # make Injury into factor, capitalize
+    Injury = factor(Injury, levels = c("sham","blast")) %>%
+      fct_recode("Sham" = "sham", "Blast" = "blast"),
+    # make Treatment into factor, capitalize
+    Treatment = factor(Treatment, levels = c("sham","VNS")) %>%
+      fct_recode("Sham" = "sham", "VNS" = "VNS"),
+    # make Round_main into factor
+    Round_main = factor(Round_main, levels = c("1", "2", "3", "4", "5", "6", "7", "8", "9")),
+    # make Cage id into factor
+    Cage = factor(Cage),
+    # add a feature called "cohort", which is either A or B
+    cohort = case_when(
+      feces_tp == 0.16 ~ "A",
+      feces_tp == 1 ~ "B"),
+    cohort = factor(cohort),
+    # add a feature for seq_name, which is the ID listed on all sequencing files
+    seq_name = case_when(
+      animal_code == 1774 ~ 1775L,
+      animal_code == 1363 ~ 1362L,
+      animal_code == 1372 ~ 1377L,
+      TRUE ~ animal_code)
+    ) %>%
+  # sort table by the SEQUENCING ID
+  arrange(seq_name) %>%
+  # replace special characters for later processing, because I'm not sure how
+  # they are handled in Linux shell scripts
+  rename(
+    c("serum_IL-1a" = `serum_IL-1α`,
+      "brain_IL-1a" = `brain_IL-1α`,
+      "brain_INF_gamma" = `brain_INFγ`)
+  ) %>%
+  # add a feature called "inj_trt_group" which has our 4 treatment groups
+  mutate(
+    inj_trt_group = factor(
+      paste0(.$Injury, " + ", .$Treatment),
+      levels = c("Sham + Sham", "Blast + Sham", "Sham + VNS", "Blast + VNS")
+      ),
+    blast         = ifelse(Injury    == "Blast",                   1, 0),
+    vns           = ifelse(Treatment == "VNS",                     1, 0),
+    blast_and_vns = ifelse(Injury == "Blast" & Treatment == "VNS", 1, 0),
+    seq_name      = as.character(seq_name),
+  )
+```
+
+```{r}
+clean_meta <- function(meta) {
+  meta %>%
+    mutate(Round_main    = droplevels(Round_main)) %>%
+    dplyr::select(where(~ !all(is.na(.)))) %>%  # same as meta <- meta[, colSums(is.na(meta)) != nrow(meta)]
+    relocate(c("cohort", "inj_trt_group"), .before = 3) %>%
+    relocate(c("animal_code", "seq_name"), .before = 1) %>%
+    dplyr::select(-c("cohort", "file_name", "feces_tp"))
+}
+
+meta_a <- clean_meta(filter(metadata, cohort == "A"))
+meta_b <- clean_meta(filter(metadata, cohort == "B"))
+
+meta_b_smaller <- meta_b %>%
+  dplyr::select(-any_of(extra_B_cols))
+```
+
+
+Note: The extra mouse was 1444 (sham-sham). I accidentally used `EtOH_pref_24h` instead of `EtOH_pref_24h_final`. 
+
+Save
+```{r, eval = FALSE}
+# Old way:
+# saveRDS(metadata, "1_preprocessed/metadata.rds")
+
+# New organized way:
+save_output(metadata, "cleaned_meta", "data/1_preprocessed")
+```
+
+
+# Preprocess Microbiome data
+```{r}
+seq_a <- metadata %>% filter(cohort == "A") %>% pull(seq_name)
+seq_b <- metadata %>% filter(cohort == "B") %>% pull(seq_name)
+```
+
+Preprocess new MetaPhlAn output myself - get *species-level count table*
+```{r}
+files <- list.files("/proj/gibbons/2024_easton_vns/metaphlan_2/metaphlan", 
+                    pattern = "_metaphlan\\.txt$", full.names = TRUE)
+
+dt <- rbindlist(lapply(files, function(f) {
+  fread(f)[, seq_name := sub("_metaphlan\\.txt$", "", basename(f))]
+}), fill = TRUE) %>%
+  rename(
+    clade_name = `#clade_name`,
+    est_n_reads = estimated_number_of_reads_from_the_clade
+    ) %>%
+  filter(seq_name %in% metadata$seq_name)
+
+s_long <- dt %>%                 # we can do this for any taxonomic level
+  filter(
+    grepl("\\|s__", clade_name) | clade_name == "UNCLASSIFIED",
+    !grepl("\\|t__", clade_name)
+  ) %>%
+  mutate(
+    clade_name = ifelse(
+      clade_name == "UNCLASSIFIED",
+      "k__unclassified|p__unclassified|c__unclassified|o__unclassified|f__unclassified|g__unclassified|s__unclassified",
+      clade_name
+      )
+  )
+
+full_taxonomy <- data.frame(full_name = unique(s_long$clade_name)) %>%
+  separate(
+    full_name,
+    sep = "\\|",
+    into = c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"), # no "Strain"
+    fill = "right",
+    remove = FALSE
+  ) %>%
+  mutate(
+    Kingdom = gsub("k__", "", Kingdom),
+    Phylum  = gsub("p__", "", Phylum),
+    Class   = gsub("c__", "", Class),
+    Order   = gsub("o__", "", Order),
+    Family  = gsub("f__", "", Family),
+    Genus   = gsub("g__", "", Genus),
+    Species = gsub("s__", "", Species)
+  )
+
+# check that all species names are still unique
+length(unique(full_taxonomy$Species)) == length(unique(full_taxonomy$full_name))
+
+s_long <- s_long %>%
+  left_join(
+    full_taxonomy %>%
+      dplyr::select(full_name, Species),
+    by = c("clade_name" = "full_name")
+    ) %>%
+  mutate(
+    clade_name = coalesce(Species, clade_name)
+    ) %>%
+  dplyr::select(-Species)
+
+s_counts <- s_long %>%
+  pivot_wider(
+    ., id_cols = "seq_name", names_from = "clade_name", values_from = "est_n_reads"
+    ) %>%
+  dplyr::select(-unclassified)   # remove because some values are negative
+
+s_relabund <- s_long %>%
+  pivot_wider(., id_cols = "seq_name", names_from = "clade_name", values_from = "relative_abundance")
+
+```
+
+Rarefy count table to lowest n_reads (for each cohort)
+  cohort A worst depth is sample *1413* (575,229 reads), followed by *1419*
+  cohort B worst depth is sample *1766* (154,195 reads), followed by *1765* <- keep an eye on this 1766 - might need to drop?
+  
+```{r}
+counts_both <- s_counts %>%
+  filter(seq_name %in% c(seq_a, seq_b)) %>%
+  dplyr::select(where(~ !all(is.na(.)))) %>%
+  mutate(across(everything(), ~replace_na(., 0))) %>%
+  column_to_rownames("seq_name")
+
+counts_a <- s_counts %>%
+  filter(seq_name %in% seq_a) %>%
+  dplyr::select(where(~ !all(is.na(.)))) %>%
+  mutate(across(everything(), ~replace_na(., 0))) %>%
+  column_to_rownames("seq_name")
+
+counts_b <- s_counts %>%
+  filter(seq_name %in% seq_b) %>%
+  dplyr::select(where(~ !all(is.na(.)))) %>%
+  mutate(across(everything(), ~replace_na(., 0))) %>%
+  column_to_rownames("seq_name")
+
+# also just go ahead and separate the relative abundance into a and b
+relabund_a <- s_relabund %>%
+  filter(seq_name %in% seq_a) %>%
+  dplyr::select(where(~ !all(is.na(.))))
+relabund_b <- s_relabund %>%
+  filter(seq_name %in% seq_b) %>%
+  dplyr::select(where(~ !all(is.na(.))))
+```
+
+## Do rarefaction by hand
+(this uses my own function `rarefy`, which is in `shannon_div_functions.R`)
+```{r}
+set.seed(145)
+raref_both <- rarefy(counts_both)  # 256 species
+raref_a <- rarefy(counts_a)        # 214 species
+raref_b <- rarefy(counts_b)        # 231 species
+
+
+# curious about presence after rarefying
+presence_a <- return.presence(raref_a, colnames(raref_a))
+presence_b <- return.presence(raref_b, colnames(raref_b))
+presence_both <- return.presence(raref_both, colnames(raref_both))
+
+hist(presence_a)
+hist(presence_b)
+hist(presence_both)
+```
+
+
+
+## Alpha Diversity Metrics
+Calculate per-sample Alpha Diversity indices:
+    *Shannon Index (richness + evenness), Berger-Parker Dominance, Observed features (richness)*
+```{r}
+alph_a <- alpha_div(raref_a)
+alph_b <- alpha_div(raref_b)
+
+alph_a
+alph_b
+```
+
+## Get cross-sectional information on each microbe
+ (presence across treatments, within treatment groups)
+```{r}
+a_bug_infos <- list(
+  "presence_df" = counts_a %>%
+    mutate(across(everything(), ~ . != 0)) %>%
+    rownames_to_column("seq_name"),
+
+  "per_sample_presence" = counts_a %>%
+    mutate(across(everything(), ~ . != 0)) %>%
+    {rowSums(.) / ncol(.)}
+)
+
+a_bug_infos$presence_by_batch <- meta_a %>%
+  transmute(seq_name, Round_main) %>%
+  left_join(a_bug_infos$presence_df, by = "seq_name") %>%
+  column_to_rownames("seq_name") %>%
+  presence_by_category(     # defined in shannon_div_functions
+    data = .,
+    category_col = "Round_main"
+  )
+
+a_bug_infos$info_df <- a_bug_infos$presence_df %>%
+  dplyr::select(-seq_name) %>%
+  summarize(across(everything(), ~ sum(.x) / n())) %>% # calculate total presence
+  pivot_longer(
+    everything(),
+    names_to = "microbe",
+    values_to = "pres_total"
+  ) %>%
+  left_join(a_bug_infos$presence_by_batch, by = "microbe") %>%
+  rename(
+    pres_batch1 = `1`,
+    pres_batch3 = `3`
+  )
+
+```
+
+
+## Processing
+```{r}
+a_clr <- filter_and_clr(
+  bug_info = a_bug_infos$info_df,
+  counts = counts_a,
+  total_presence = 0.3,
+  batch_presence = 0.1,
+  impute_method = "GBM",
+  filt_before_clr = TRUE,
+  ctrl_batch = TRUE
+)
+
+a_features <- join_bugs_and_div(
+  raw_clr_df = a_clr$clr_df_raw,
+  raw_alpha_df = alph_a
+)
+
+a_features
+```
+
+Merge all data into one df 
+  Treatments (exposures) are binary
+  Microbes are filtered, CLR-transformed, and then z-scored
+  Outcome variables are z-scored
+  *Alpha diversity is z-scored!*
+  
+`a_features` is now very similar to `"../data/processed/A_clr_df_withalpha_0206.rds"`, except it doesn't have metadata or cytokine PCs yet.

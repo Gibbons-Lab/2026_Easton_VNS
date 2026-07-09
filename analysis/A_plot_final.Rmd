@@ -1,0 +1,1121 @@
+---
+title: "A_plot_final.Rmd"
+author: "Alyssa N. Easton"
+date: '2025-02-18'
+output:
+---
+
+Plot results from A_joint_final, save in PDF format
+
+## Setup
+```{r "setup", include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache=TRUE)
+knitr::opts_knit$set(root.dir = file.path(Sys.getenv("VNS_ROOT"), "data"))  # stored VNS_ROOT in ~/.Renviron
+options(expressions = 6000)  # Increase allowed recursion depth
+options(digits = 4) ## Formats output to 10 digits
+library(magrittr)
+library(tidyverse)
+library(broom)
+library(broom.helpers)
+library(rlang)
+library(glue)
+library(janitor)
+library(purrr)
+library(ggh4x)
+library(parallel)
+library(parallelly)
+library(pbapply)
+library(furrr)      # future_pmap comes from here
+library(future)
+library(limma)
+library(ggeffects)
+library(patchwork)
+library(car)
+library(scales)
+library(future.apply)
+library(ComplexHeatmap)
+library(circlize)
+library(cowplot)
+library(Cairo)
+library(grid)
+library(gridExtra)
+library(ggtext)
+library(lme4)
+library(lmerTest)
+library(ggsignif)
+library(emmeans)
+library(ggpubr) # stat_pvals_manual
+library(gtable)
+# source("/proj/gibbons/2024_easton_vns/workflow/functions/mdact.R")
+# source("/proj/gibbons/2024_easton_vns/workflow/functions/june_functions.R")
+# source("/proj/gibbons/2024_easton_vns/workflow/functions/shannon_div_functions.R")
+# source("/proj/gibbons/2024_easton_vns/workflow/functions/artifact_correct_functions.R")
+# source("/proj/gibbons/2024_easton_vns/workflow/functions/lmer_functions.R")
+source("/proj/gibbons/2024_easton_vns/workflow/functions/final_form_functions.R")
+```
+
+
+Plotting functions moved to `final_form_functions.R`
+
+# 2: Analyzing DA and M-DACT results
+
+Since I already ran prior analyses, I can just import these dfs
+```{r}
+df  <- readRDS("../data/processed/A_clr_df_withalpha_0206.rds") %>%
+  mutate(inj_trt_group = fct_relevel(inj_trt_group, "Sham + Sham", "Blast + Sham", "Sham + VNS", "Blast + VNS")) %>%
+  mutate(
+    Injury = factor(ifelse(inj_trt_group %in% c("Sham + Sham", "Sham + VNS"), "Sham", "Blast"), levels = c("Sham", "Blast")),
+    Treatment = factor(ifelse(inj_trt_group %in% c("Sham + VNS", "Blast + VNS"), "VNS", "Sham"), levels = c("Sham", "VNS"))
+  )
+
+model_microbe <- readRDS("../data/3_newest/A_microbe_models_0212.rds")
+model_outcome <- readRDS("../data/3_newest/A_outcome_models_0212.rds")
+all_p_df      <- readRDS("../data/3_newest/A_p_values_0212.rds")
+all_run_df    <- readRDS("../data/3_newest/A_mediation_0212.rds")
+coef_df <- readRDS("../data/3_newest/A_microbe_coef_dfs_0218.rds")
+m_coef_df <- coef_df$m
+y_coef_df <- coef_df$y
+ci_df <- readRDS("/proj/gibbons/2024_easton_vns/data/3_newest/A_bootCI_df_0212.rds")
+
+m_lrt <- model_microbe %>%
+  transmute(microbe, term, "p" = p.value, "q" = adj.p) %>%
+  filter(term %in% c("blast", "vns")) %>%
+  pivot_wider(
+    id_cols = "microbe", names_from = "term",
+    values_from = c("p", "q"),
+    names_glue = "{.value}_{term}"
+    ) %>%
+  mutate(
+    blast_signif = ifelse(q_blast < 0.2, "Blast", ""),
+    vns_signif = ifelse(q_vns < 0.2, "VNS", ""),
+    # microbe = gsub("_", " ", microbe)
+  )
+
+da_hits <- m_lrt %>% filter(blast_signif == "Blast" | vns_signif == "VNS")
+da_bugs <- da_hits %>% pull(microbe) %>% unique()
+
+med_hits <- all_run_df %>%
+  filter(!is.na(signif_at) & signif_at <= 0.2) %>%
+  rowwise() %>% mutate(bug_out = paste0(mediator, ";", outcome)) %>%
+  dplyr::select(-any_of(starts_with("dact_thr")))
+
+outcome_hits <- map_dfr(model_outcome, function(df) {
+  df %>% filter(term == "microbe", adj.p < 0.2) }) %>%
+  rowwise() %>% mutate(bug_out = paste0(microbe, ";", outcome)) %>%
+  arrange(adj.p) %>%
+  mutate(hit_type = factor(ifelse(bug_out %in% med_hits$bug_out, "mediator", "non-mediator")))
+```
+
+Set up scales early for microbe abundance + outcome
+```{r}
+########################  heatmap values of microbes  ########################  
+all_plotted_bugs <- c(
+  da_bugs, med_hits$mediator, outcome_hits$microbe
+) %>% unique()
+
+max_bug_value <- m_coef_df %>%
+  filter(microbe %in% all_plotted_bugs) %>% 
+  dplyr::select(contains("est_")) %>%
+  max(abs(.))
+
+bug_color <- colorRamp2(  # formerly col_fun
+  seq(-max_bug_value, max_bug_value, length.out = 11),
+  rev(RColorBrewer::brewer.pal(11, "RdBu"))
+)
+
+
+########################  heatmap values of outcomes  ########################  
+all_plotted_out <- unique(med_hits$bug_out)  # unique(c(outcome_hits$bug_out, med_hits$bug_out))
+
+max_out_value <- y_coef_df %>%
+  mutate(bug_out = paste0(microbe, ";", outcome)) %>%
+  filter(bug_out %in% all_plotted_out) %>%
+  dplyr::select(contains("est")) %>%
+  max(abs(.))
+
+# the max_out_value of 4 is coming from the Blast:VNS term of an outcome hit that is not a mediator
+# for now, I'm not going to plot it.
+
+out_color <- colorRamp2(  # formerly col_fun
+  seq(-max_out_value, max_out_value, length.out = 11),
+  rev(RColorBrewer::brewer.pal(11, "PiYG"))
+)
+
+########################  FDR colors  ########################  
+fdr_value_vector <- c(# rev(c(
+  "0.100" = 0.1,
+  "0.125" = 0.125,
+  "0.150" = 0.15,
+  "0.175" = 0.175,
+  "0.200" = 0.2) #)
+
+fdr_color <- colorRamp2(  # formerly col_fun
+  seq(min(fdr_value_vector), max(fdr_value_vector), length.out = 5),
+  # RColorBrewer::brewer.pal(5, "BuPu")
+  rev(RColorBrewer::brewer.pal(5, "BuPu"))
+)
+```
+
+Which outcome names do I need to edit?
+plotted_outcomes <- all_plotted_out %>% gsub("^.*?;", "", .) %>% unique()
+
+```{r}
+max_bug_value
+max_out_value
+```
+
+
+Build legends
+```{r}
+bug_lgd <- Legend(col_fun = bug_color, title = "Effect on \nMicrobe", at = c(-2.5, 0, 2.5))
+out_lgd <- Legend(col_fun = out_color, title = "Effect on \nOutcome", at = c(-1.5, 0, 1.5))
+fdr_lgd <- Legend(col_fun = fdr_color, title = "Mediation \nFDR <",   at = fdr_value_vector,
+                  labels = names(fdr_value_vector))
+
+blast_lgd <- Legend(
+  labels = c("Blast", "VNS"),
+  legend_gp = gpar(fill = c("#0492c2", "#FFc067")),
+  title = "LRT FDR < 0.2"
+  )
+
+pd <- packLegend(bug_lgd, blast_lgd, out_lgd, fdr_lgd, direction = "vertical")
+```
+
+```{r, fig.width = 2, fig.height = 5}
+# create a viewport
+grid.newpage()
+pushViewport(viewport(width = 1, height = 1))
+
+# Draw the whole stack at once, aligned to the left
+draw(pd, x = unit(0.5, "cm"), y = unit(0.5, "npc"), just = "left")
+
+```
+Save it
+```{r}
+pdf("../figures/A_heatmap_legends.pdf", width = 2, height = 5)
+draw(pd, x = unit(0.5, "cm"), y = unit(0.5, "npc"), just = "left")
+dev.off()
+```
+
+## Plotting
+### Exposure -> microbe
+```{r}
+m_coef_df %>% filter(microbe %in% da_bugs)
+
+da_blast <- setNames(da_hits$blast_signif, nm = da_hits$microbe)
+da_vns   <- setNames(da_hits$vns_signif,   nm = da_hits$microbe)
+```
+
+Taxonomy of these guys:
+```{r}
+all_data <- readRDS("/proj/gibbons/2024_easton_vns/data/1_preprocessed/species_october.rds")
+taxmap <- all_data$taxonomy_map
+taxmap %>% filter(Species %in% da_bugs)
+```
+```{r}
+da_bugs
+med_bugs <- med_hits %>% pull(mediator) %>% unique()
+taxmap %>% filter(Species %in% med_bugs)
+```
+
+
+### Microbe Heat map
+```{r, fig.width = 5, fig.height = 4.5}
+m_coef_mat <- m_coef_df %>%
+  filter(microbe %in% da_bugs) %>%
+  # mutate(microbe = gsub("_", " ", microbe)) %>%
+  column_to_rownames("microbe") %>%
+  dplyr::select(contains("est")) %>%
+  as.matrix()
+
+colnames(m_coef_mat) <- c("Blast", "VNS", "Blast:VNS")
+
+m_p_mat <- m_coef_df %>%
+  filter(microbe %in% da_bugs) %>%
+  # mutate(microbe = gsub("_", " ", microbe)) %>%
+  column_to_rownames("microbe") %>%
+  dplyr::select(contains("p")) %>%
+  mutate(
+    p_blast = case_when(p_blast < 0.001 ~ "**", p_blast < 0.05 ~ "*", .default = ""),
+    p_vns   = case_when(p_vns   < 0.001 ~ "**", p_vns   < 0.05 ~ "*", .default = ""),
+    p_bv    = case_when(p_bv    < 0.001 ~ "**", p_bv    < 0.05 ~ "*", .default = "")
+    ) %>%
+  as.matrix()
+
+da_blast <- da_blast[rownames(m_coef_mat)] # %>% as.factor()
+da_vns   <- da_vns[rownames(m_coef_mat)] # %>% as.factor()
+
+blast_color <- c("Blast" = "#0492c2")
+vns_color   <- c("VNS"   = "#FFc067") # NA values show up as transparent anyways
+```
+
+
+Where da_vns is a named array denoting whether a microbe was significant for VNS (TRUE/FALSE), and da_blast similarly for Blast.
+
+```{r, fig.width = 1, fig.height = 1}
+lrt_ann_blast<- rowAnnotation(
+  "Blast" = da_blast,
+  col = list("Blast" = blast_color),
+  show_annotation_name = FALSE,
+  show_legend = FALSE,
+  simple_anno_size = unit(0.2, "cm"),
+  na_col = "#FFFFFF00",
+  annotation_legend_param = list(title = NULL)
+)
+
+lrt_ann_vns <- rowAnnotation(
+  "VNS" = da_vns,
+  col = list("VNS" = vns_color),
+  show_annotation_name = FALSE,
+  show_legend = FALSE,
+  simple_anno_size = unit(0.2, "cm"),
+  na_col = "#FFFFFF00",
+  annotation_legend_param = list(title = NULL)
+)
+
+plot(lrt_ann_blast + lrt_ann_vns)
+```
+
+
+```{r, fig.width=8, fig.height=17}
+wide <- 2 * ncol(m_coef_mat)
+high <- 2 * nrow(m_coef_mat)
+
+ht <- Heatmap(
+  m_coef_mat,
+  name = "Estimate",
+  col = bug_color,
+  cluster_columns = FALSE,
+  show_row_dend = FALSE,
+  show_column_dend = FALSE,
+  left_annotation = c(lrt_ann_vns, lrt_ann_blast) ,
+  cluster_rows = TRUE,
+  row_labels = clean_bug_names(rownames(m_coef_mat)),
+  column_names_rot = 45,
+  row_split = da_vns,
+  row_title = NULL,
+  cluster_row_slices = TRUE,
+  
+  show_heatmap_legend = FALSE,
+  
+  width  = unit(wide, "cm"),
+  height = unit(high, "cm"),
+  row_names_gp = grid::gpar(fontsize = 20, fontface = "italic"),
+  column_names_gp = grid::gpar(fontsize = 20),
+  
+  cell_fun = function(j, i, x, y, w, h, fill) {
+    grid::grid.text(
+      m_p_mat[i, j],
+      x = x,
+      y = y,
+      gp = grid::gpar(
+        fontsize = 24,
+        col = "black",
+        fontface = "bold"
+      )
+    )
+  })
+```
+
+```{r, fig.width = 10, fig.height = 17}
+# create a viewport
+grid.newpage()
+pushViewport(viewport(width = 1, height = 1))
+draw(ht)
+```
+
+```{r}
+pdf("../figures/A_microbe_abundance_fdr20.pdf", width = 8, height = 17)
+ht_drawn <- draw(ht)
+# row_ord <- row_order(ht_drawn)
+# da_bug_order <- rownames(trt_effect_matrix)[row_ord]
+dev.off()
+```
+
+
+Romboutsia is generally increased by treatment, but especially blast
+Clostridiales is generally increased by blast, but especially on VNS background
+SGB41718 is generally decreased by blast, but especially on VNS background
+
+Can also plot/test "presence/absence" if reviewers request, but the results did align well when I tested them for sparse features (as in, sparse bugs that were significant in the CLR regressions were actually even more significant if I did a presence/absence logistic regression, because CLR-transforming zeroes is just adding noise).
+
+## Bulk plots
+```{r, attr.message=FALSE}
+# check this!!!
+levels(df$inj_trt_group)
+
+# bugs associated with outcome, microbe vs. residual Outcome
+a_pdf_split(
+    hit_df        = outcome_hits,
+    data_df       = df,
+    sub_height    = 5,
+    sub_width     = 5.5,
+    n_cols        = 4,
+    plot_function = "residout_bug",
+    filename      = "../figures/A_outhits_scatter_X_rY.pdf"
+    )
+
+med_hits_renamed <- med_hits %>% rename(microbe = mediator)
+
+# Mediators, microbe VS residual Outcome
+a_pdf_split(
+    hit_df        = med_hits_renamed,
+    data_df       = df,
+    sub_height    = 5,
+    sub_width     = 5.5,
+    n_cols        = 4,
+    plot_function = "residout_bug",
+    filename      = "../figures/A_medhits_scatter_X_rY.pdf"
+    )
+
+# Mediators, residual microbe VS residual Outcome
+a_pdf_split(
+    hit_df        = med_hits_renamed,
+    data_df       = df,
+    sub_height    = 5,
+    sub_width     = 5.5,
+    n_cols        = 4,
+    plot_function = "residout_residbug",
+    filename      = "../figures/A_medhits_scatter_rX_rY.pdf"
+    )
+
+# Box plots of microbes associated with exposure
+a_pdf_split(
+    hit_df        = da_bugs,
+    data_df       = df,
+    plot_function = "box_easier",
+    filename      = "../figures/A_dahits_box.pdf",
+    sub_height = 5, sub_width = 5, n_cols = 4
+    )
+
+# Box plots of microbes associated with outcome
+a_pdf_split(
+    hit_df        = outcome_hits$microbe,
+    data_df       = df,
+    plot_function = "box_easier",
+    filename      = "../figures/A_outhits_box.pdf",
+    sub_height = 5, sub_width = 5, n_cols = 4
+    )
+
+# Box plots of mediators
+a_pdf_split(
+    hit_df        = med_hits$mediator,
+    data_df       = df,
+    plot_function = "box_easier",
+    filename      = "../figures/A_medhits_box.pdf",
+    sub_height = 5, sub_width = 5, n_cols = 4
+    )
+```
+
+
+## New bulk plots
+```{r}
+bug_label_df <- data.frame(dv = unique(model_microbe$microbe)) %>%
+  mutate(label = clean_bug_names(dv))
+
+a_da_plots <- plot_multiple_dv(
+  data = df,
+  dvs = da_bugs,
+  groups = "inj_trt_group",
+  factorA = "Injury",
+  factorB = "Treatment",
+  x_positions = c(4, 10, 20, 26),
+  axis_length = 30,
+  palette = injtrt_pal,
+  label_df = bug_label_df,
+  italicize = TRUE,
+  ylab_size = 20,
+  show_legend = FALSE,
+  fit_fun = aov,
+  comparison_mode = "reduced",
+  factorA_level_for_factorB = "Blast",
+  return_plots = TRUE
+  ) %>%
+  purrr::map(., ~
+  ggdraw(.x) +
+    draw_grob(
+      make_manual_legend(blast_pal),
+      x = -0.10, y = 1.36,
+      hjust = 0, vjust = 1
+    )
+)
+
+a_out_plots <- plot_multiple_dv(
+  data = df,
+  dvs = outcome_hits$microbe,
+  groups = "inj_trt_group",
+  factorA = "Injury",
+  factorB = "Treatment",
+  x_positions = c(4, 10, 20, 26),
+  axis_length = 30,
+  palette = injtrt_pal,
+  label_df = bug_label_df,
+  italicize = TRUE,
+  ylab_size = 20,
+  show_legend = FALSE,
+  fit_fun = aov,
+  comparison_mode = "reduced",
+  factorA_level_for_factorB = "Blast",
+  return_plots = TRUE
+  ) %>%
+  purrr::map(., ~
+  ggdraw(.x) +
+    draw_grob(
+      make_manual_legend(blast_pal),
+      x = -0.10, y = 1.36,
+      hjust = 0, vjust = 1
+    )
+)
+
+a_med_plots <- plot_multiple_dv(
+  data = df,
+  dvs = med_hits$mediator,
+  groups = "inj_trt_group",
+  factorA = "Injury",
+  factorB = "Treatment",
+  x_positions = c(4, 10, 20, 26),
+  axis_length = 30,
+  palette = injtrt_pal,
+  label_df = bug_label_df,
+  italicize = TRUE,
+  ylab_size = 20,
+  show_legend = FALSE,
+  fit_fun = aov,
+  comparison_mode = "reduced",
+  factorA_level_for_factorB = "Blast",
+  return_plots = TRUE
+  ) %>%
+  purrr::map(., ~
+  ggdraw(.x) +
+    draw_grob(
+      make_manual_legend(blast_pal),
+      x = -0.10, y = 1.36,
+      hjust = 0, vjust = 1
+    )
+)
+
+a_da_plots[[1]]
+```
+```{r}
+a_med_biplots <- generate_adjusted_plots(
+  data = df,
+  x_vars = med_hits$mediator,
+  y_vars = med_hits$outcome,
+  method = "lm"
+)
+
+a_out_biplots <- generate_adjusted_plots(
+  data = df,
+  x_vars = outcome_hits$microbe,
+  y_vars = outcome_hits$outcome,
+  method = "lm"
+)
+
+a_med_biplots[[1]]
+a_out_biplots[[1]]
+```
+
+```{r}
+pages <- list(
+  list(
+    title = "Differentially-Abundant Species",
+    plots = a_da_plots,
+    layout = "grid_paginated",
+    ncol = 4,
+    n_per_page = 20
+  ),
+  list(
+    title = "Mediator Species",
+    plots = a_med_plots,
+    layout = "grid_paginated",
+    ncol = 4,
+    n_per_page = 20
+  ),
+  list(
+    title = "Mediator Species vs. Outcome",
+    plots = a_med_biplots,
+    layout = "grid_paginated",
+    ncol = 4,
+    n_per_page = 20
+  ),
+  list(
+    title = "Outcome-associated Species",
+    plots = a_out_plots,
+    layout = "grid_paginated",
+    ncol = 4,
+    n_per_page = 20
+  ),
+  list(
+    title = "Outcome-associated Species vs. Outcome",
+    plots = a_out_biplots,
+    layout = "grid_paginated",
+    ncol = 4,
+    n_per_page = 20
+  )
+)
+
+save_pages(
+  pages,
+  file = "../figures/A_supplemental_plots.pdf",
+  width = 20, # 4 * 5
+  height = 30 # 5 * 6
+)
+```
+
+
+
+
+
+bugs_to_plot <- unique(c(da_bugs, outcome_hits$microbe, med_hits$mediator)) %>% sort() # put in alphabetical order
+
+
+# Big mediaton plot
+## Plot coefficients for mediators + annotate with p-values
+```{r}
+med_bugs <- unique(med_hits$mediator) # luckily they are all unique
+
+med_bugs <- med_hits %>%
+  filter(signif_at <= 0.2) %>%
+  pull(mediator)
+
+m_coef_mat <- m_coef_df %>%
+  filter(microbe %in% med_bugs) %>%
+  column_to_rownames("microbe") %>%
+  dplyr::select(contains("est")) %>%
+  as.matrix()
+
+m_p_mat <- m_coef_df %>%
+  filter(microbe %in% med_bugs) %>%
+  column_to_rownames("microbe") %>%
+  dplyr::select(contains("p")) %>%
+  mutate(
+    p_blast = case_when(p_blast < 0.001 ~ "**", p_blast < 0.05 ~ "*", .default = ""),
+    p_vns   = case_when(p_vns   < 0.001 ~ "**", p_vns   < 0.05 ~ "*", .default = ""),
+    p_bv    = case_when(p_bv    < 0.001 ~ "**", p_bv    < 0.05 ~ "*", .default = "")
+    ) %>%
+  as.matrix()
+
+y_coef_mat <- y_coef_df %>%
+  semi_join(med_hits, by = c("outcome", "microbe" = "mediator")) %>%
+  column_to_rownames("microbe") %>%
+  dplyr::select(contains("est")) %>%
+  as.matrix()
+
+y_p_mat <- y_coef_df %>%
+  semi_join(med_hits, by = c("outcome", "microbe" = "mediator")) %>%
+  column_to_rownames("microbe") %>%
+  dplyr::select(contains("p")) %>%
+  mutate(
+    p_blast = case_when(p_blast < 0.001 ~ "**", p_blast < 0.05 ~ "*", .default = ""),
+    p_vns   = case_when(p_vns   < 0.001 ~ "**", p_vns   < 0.05 ~ "*", .default = ""),
+    p_bv    = case_when(p_bv    < 0.001 ~ "**", p_bv    < 0.05 ~ "*", .default = ""),
+    p_microbe = case_when(p_microbe < 0.001 ~ "**", p_microbe    < 0.05 ~ "*", .default = "")
+    ) %>%
+  as.matrix()
+
+row_order <- rownames(m_coef_mat)
+y_coef_mat <- y_coef_mat[row_order, c(colnames(m_coef_mat), "est_microbe")]
+y_p_mat <- y_p_mat[row_order, c(colnames(m_p_mat), "p_microbe")]
+
+row_outcome <- med_hits %>%
+  distinct(mediator, outcome) %>%
+  filter(mediator %in% rownames(m_coef_mat)) %>%
+  tibble::deframe()
+
+row_exposure <- med_hits %>%
+  distinct(mediator, exposure) %>%
+  filter(mediator %in% rownames(m_coef_mat)) %>%
+  tibble::deframe()
+
+row_fdr <- med_hits$signif_at
+names(row_fdr) <- med_hits$mediator
+
+row_outcome <- row_outcome[rownames(m_coef_mat)]
+row_exposure <- row_exposure[rownames(m_coef_mat)]
+row_fdr <- row_fdr[rownames(m_coef_mat)]
+
+
+stopifnot(all(names(row_outcome) == rownames(m_coef_mat)))
+stopifnot(all(names(row_outcome) == rownames(y_coef_mat)))
+stopifnot(all(names(row_fdr) == rownames(row_outcome)))
+
+exposure_color <- c("pm_blast" = "#0492c2", "pm_vns" = "#FFc067")
+```
+
+
+```{r, fig.width = 1, fig.height = 1}
+fdr_annotation <- rowAnnotation(
+  "FDR <" = row_fdr,
+  col = list("FDR <" = fdr_color),
+  simple_anno_size = unit(0.2, "cm"),
+  show_annotation_name = FALSE,
+  show_legend = FALSE,
+  annotation_legend_param = list(title = NULL)
+)
+
+which_exposure <- rowAnnotation(
+  "Exposure" = row_exposure,
+  col = list("Exposure" = exposure_color),
+  simple_anno_size = unit(0.2, "cm"),
+  show_annotation_name = FALSE,
+  show_legend = FALSE,
+  annotation_legend_param = list(title = NULL)
+)
+
+plot(fdr_annotation + which_exposure)
+```
+
+
+```{r}
+wide <- 2 * ncol(m_coef_mat)
+high <- 2 * nrow(m_coef_mat)
+row_exposure_clean <- row_exposure %>% gsub("pm_blast", "Blast", .) %>% gsub("pm_vns", "VNS", .)
+
+# heatmap model M coefficients
+ht_m <- Heatmap(
+  m_coef_mat,
+  name = "M Estimate",
+  col = bug_color,
+  left_annotation = which_exposure,
+  
+  row_split = row_exposure_clean,
+  row_title = NULL,
+  
+  cluster_rows = TRUE,
+  cluster_row_slices = TRUE,
+  show_row_dend = FALSE,
+  row_labels = clean_bug_names(rownames(m_coef_mat)),
+  row_names_gp = grid::gpar(fontsize = 20, fontface = "italic"),
+  
+  
+  column_labels = c("Blast", "VNS", "Blast:VNS"),
+  column_names_rot = 45,
+  column_names_gp = grid::gpar(fontsize = 20),
+  show_heatmap_legend = FALSE,
+  show_column_dend = FALSE,
+  cluster_columns = FALSE,
+  
+  # row_title_rot = 0,
+  # row_title_gp = grid::gpar(fontsize = 20), 
+  
+  width  = unit(wide, "cm"),
+  height = unit(high, "cm"),
+  
+  cell_fun = function(j, i, x, y, w, h, fill) {
+    grid::grid.text(
+      m_p_mat[i, j],
+      x = x,
+      y = y,
+      gp = grid::gpar(
+        fontsize = 24,
+        col = "black",
+        fontface = "bold"
+      )
+    )
+  })
+```
+
+```{r}
+wide <- 2 * ncol(y_coef_mat)
+high <- 2 * nrow(y_coef_mat)
+
+
+# heatmap model Y coefficients
+ht_y <- Heatmap(
+  y_coef_mat,
+  name = "Y Estimate",
+  col = out_color,
+  show_heatmap_legend = FALSE,
+  left_annotation = fdr_annotation,
+  
+  row_split = row_exposure_clean,
+  row_title = NULL,
+  cluster_rows = TRUE,
+  cluster_row_slices = TRUE,
+  show_row_dend = FALSE,
+  row_labels = clean_bug_names(rownames(y_coef_mat)),
+  row_names_gp = grid::gpar(fontsize = 20, fontface = "italic"),
+  
+  column_labels = c("Blast", "VNS", "Blast:VNS", "microbe"),
+  cluster_columns = FALSE,
+  show_column_dend = FALSE,
+  column_names_rot = 45,
+  column_names_gp = grid::gpar(fontsize = 20),
+  
+  width  = unit(wide, "cm"),
+  height = unit(high, "cm"),
+  
+  cell_fun = function(j, i, x, y, w, h, fill) {
+    grid::grid.text(
+      y_p_mat[i, j],
+      x = x,
+      y = y,
+      gp = grid::gpar(
+        fontsize = 24,
+        col = "black",
+        fontface = "bold"
+      )
+    )
+  })
+```
+
+
+```{r, fig.width = 11, fig.height = 11}
+ht_list <- ht_m + ht_y
+draw(ht_list, main_heatmap = "M Estimate")
+```
+
+Now save
+```{r}
+pdf("../figures/A_med_coef_heatmap.pdf", width = 11, height = 11)
+ht_drawn <- draw(ht_list, main_heatmap = "M Estimate")
+rows <- row_order(ht_drawn)
+dev.off()
+```
+
+## Plotting blast mediation hits
+*Doing this after heat maps so I can use same order as clustering*
+```{r}
+ht_row_order <- c(unlist(rows))
+names(ht_row_order) <- NULL
+ht_row_order
+
+ci_row_order <- row_order[ht_row_order]
+ci_row_order
+```
+
+
+```{r}
+ci_plt <- ci_df %>%
+  filter(mediator %in% ci_row_order) %>%
+  mutate(
+    exposure = factor(exposure, levels = c("blast", "vns")),
+    mediator = factor(mediator, levels = ci_row_order),     # don't reverse
+    outcome  = factor(outcome, levels = c("OFB_Clatency", "OFB_Cdistance", "PD_choice_filt", "EtOH_pref_24h_final")),
+    exp_med_out  = as.character(interaction(exposure, mediator, outcome, sep = ";"))
+    ) %>%
+  pivot_longer(
+    cols = matches("^(ACME|ADE|Total)_"),
+    names_to = c("effect", "cond", ".value"),
+    names_pattern = "^([^_]+)_([^_]+)_(.+)$"
+  ) %>%
+  mutate(
+    effect = factor(effect, levels = c("ACME", "ADE", "Total")),
+    cond   = factor(cond, levels = c("cond0", "cond1")),        # fct_recode(., "new" = "old")
+    # exp_med_out = factor(paste0(exposure, ";", outcome, ";", mediator)),
+    exp_med_out_cond = factor(paste0(exp_med_out, ";", cond))
+    # microbe = factor(mediator)
+  ) %>%
+  arrange(mediator)
+
+shade_bands <- ci_plt %>%
+  group_by(mediator) %>% 
+  arrange(by = mediator) %>%
+  mutate(
+    band_id = as.numeric(mediator),
+    fill = ifelse(band_id %% 2 == 1, "grey95", "transparent")
+    )
+
+effect_colors <- c(
+  "ADE"   = "#9C2121",
+  "ACME"  = "#689835",
+  "Total" = "#070E00"
+)
+```
+
+```{r, fig.width = 7, fig.height = 3.5}
+ci_absmax <- max(abs(c(ci_plt$upper, ci_plt$lower))) * 1.1
+
+plt <- ggplot(ci_plt, aes(x = est, y = effect, color = effect)) +
+  geom_rect(data = shade_bands, aes(
+      xmin = -Inf, xmax = Inf,
+      ymin = -Inf, ymax = Inf,
+      fill = fill
+      ), inherit.aes = FALSE, color = NA) +
+  geom_point(size = 1.5) +
+  geom_linerange(aes(xmin = lower, xmax = upper), linewidth = 0.4) +
+  scale_fill_identity() +
+  # geom_errorbarh(aes(xmin = mean - se, xmax = mean + se), linewidth = 0.3, height = 0.5) +
+  scale_color_manual(values = effect_colors) +
+  facet_grid(
+    rows = vars(mediator), # if multiple exposure/outcomes, use exp_med_out
+    cols   = vars(cond),
+    space  = "free_y",
+    # switch = "y", scales = "free_y",
+    ) +
+  scale_x_continuous(limits = c(-ci_absmax, ci_absmax)) +
+  labs(x = NULL, y = NULL) +
+  guides(fill = guide_legend(reverse = TRUE)) +
+  theme_minimal(base_size = 14) +
+  theme(
+    strip.placement   = "outside",
+    panel.spacing.y   = unit(0.1, "lines"),   # try 1-3 "lines" of spacing
+    panel.spacing.x   = unit(0.1, "lines"),   # put close together
+    axis.text.y       = element_blank(),
+    axis.ticks.y      = element_blank(),
+    axis.ticks.x      = element_line(color = "black", linewidth = 0.3),
+    axis.line.x       = element_line(colour = "black", linewidth = 0.4),
+    panel.grid        = element_blank(),
+    panel.background  = element_blank()
+  )
+
+plt1 <- plt + theme(
+  legend.position    = "none",
+  strip.text.y.right = element_text(
+    angle = 0, margin = margin(l = 4, unit = "pt"), hjust = 0
+    )
+  # strip.text.x.top = c("")
+  )
+
+plt2 <- plt + theme(legend.position = "none", strip.text.y.right = element_blank())
+
+plt_leg <- plt + theme(strip.text.y.right = element_blank())
+legend_only <- get_legend(plt_leg)
+
+plt1
+```
+
+do as device instead (so I can save plot with legend)
+```{r}
+row_height  <- 0.5
+panel_width <- 2
+
+pdf("../figures/A_med_blast_cond_blocked.pdf",
+    width = (panel_width*2) + 3,
+    height = (nlevels(shade_bands$mediator) * row_height))
+
+print(plt1)
+plot(legend_only)
+dev.off()
+```
+
+## Plot Blast (+/- VNS) and VNS (+/- Blast) separately
+```{r}
+blast_row_order <- ci_row_order[ci_row_order %in% ci_df$mediator[ci_df$exposure == "blast"]]
+
+blast_ci_plt <- ci_df %>%
+  filter(
+    mediator %in% blast_row_order
+    ) %>%
+  mutate(
+    exposure = factor(exposure, levels = c("blast", "vns")),
+    mediator = factor(mediator, levels = blast_row_order),     # don't reverse
+    outcome  = factor(outcome),  # , #levels = c("OFB_Clatency", "OFB_Cdistance", "PD_choice_filt", "EtOH_pref_24h_final")),
+    exp_med_out  = as.character(interaction(exposure, mediator, outcome, sep = ";"))
+    ) %>%
+  pivot_longer(
+    cols = matches("^(ACME|ADE|Total)_"),
+    names_to = c("effect", "cond", ".value"),
+    names_pattern = "^([^_]+)_([^_]+)_(.+)$"
+  ) %>%
+  mutate(
+    effect = factor(effect, levels = c("ACME", "ADE", "Total")),
+    cond   = factor(cond, levels = c("cond0", "cond1")),        # fct_recode(., "new" = "old")
+    # exp_med_out = factor(paste0(exposure, ";", outcome, ";", mediator)),
+    exp_med_out_cond = factor(paste0(exp_med_out, ";", cond))
+    # microbe = factor(mediator)
+  ) %>%
+  arrange(mediator)
+
+blast_shade_bands <- blast_ci_plt %>%
+  group_by(mediator) %>% 
+  arrange(by = mediator) %>%
+  mutate(
+    band_id = as.numeric(mediator),
+    fill = ifelse(band_id %% 2 == 1, "grey95", "transparent")
+    )
+
+line_data <- data.frame(
+  col_group = c("cond0", "cond1"),
+  x_center  = c(0, 0) # These are your "centers"
+)
+```
+
+```{r, fig.width = 7, fig.height = 3.5}
+ci_absmax <- max(abs(c(ci_plt$upper, ci_plt$lower)))
+blast_cond <- c("VNS (-)", "VNS (+)")
+
+blast_plt <- ggplot(blast_ci_plt, aes(x = est, y = effect, color = effect)) +
+  geom_rect(data = blast_shade_bands, aes(
+      xmin = -Inf, xmax = Inf,
+      ymin = -Inf, ymax = Inf,
+      fill = fill
+      ), inherit.aes = FALSE, color = NA) +
+  geom_point(size = 1.5) +
+  geom_linerange(aes(xmin = lower, xmax = upper), linewidth = 0.4) +
+  scale_fill_identity() +
+  scale_color_manual(values = effect_colors) +
+  facet_grid(
+    rows = vars(mediator), # if multiple exposure/outcomes, use exp_med_out
+    cols   = vars(cond),
+    labeller = labeller(
+      cond = c("cond0" = "VNS (-)", "cond1" = "VNS (+)"),
+      mediator = as_labeller(format_mediator_labels)
+      ),
+    space  = "free_y"
+    ) +
+  scale_x_continuous(limits = c(-ci_absmax, ci_absmax)) +
+  labs(x = NULL, y = NULL) +
+  guides(fill = guide_legend(reverse = TRUE)) +
+  
+  geom_vline(data = line_data, 
+             aes(xintercept = x_center), 
+             linetype = "dashed", 
+             color = "darkgrey", 
+             size = 0.5, alpha = 0.5) +
+  
+  theme_minimal(base_size = 14) +
+  theme(
+    strip.placement   = "outside",
+    panel.spacing.y   = unit(0.1, "lines"),   # try 1-3 "lines" of spacing
+    panel.spacing.x   = unit(0.1, "lines"),   # put close together
+    axis.text.y       = element_blank(),
+    axis.ticks.y      = element_blank(),
+    axis.ticks.x      = element_line(color = "black", linewidth = 0.3),
+    axis.line.x       = element_line(colour = "black", linewidth = 0.4),
+    panel.grid        = element_blank(),
+    panel.background  = element_blank()
+  )
+
+blast_plt1 <- blast_plt + theme(
+  legend.position    = "none",
+  strip.text.y.right = element_markdown(
+    angle = 0, margin = margin(l = 4, unit = "pt"), hjust = 0
+    ),
+  strip.text.x.top = element_text()
+  )
+
+# blast_plt2 <- blast_plt + theme(legend.position = "none", strip.text.y.right = element_blank())
+
+blast_plt_leg <- blast_plt + theme(strip.text.y.right = element_blank())
+blast_legend_only <- get_legend(blast_plt_leg)
+
+blast_plt1
+```
+
+Repeat for VNS
+```{r}
+vns_row_order <- ci_row_order[ci_row_order %in% ci_df$mediator[ci_df$exposure == "vns"]]
+
+vns_ci_plt <- ci_df %>%
+  filter(
+    mediator %in% vns_row_order
+    ) %>%
+  mutate(
+    exposure = factor(exposure, levels = c("blast", "vns")),
+    mediator = factor(mediator, levels = vns_row_order),     # don't reverse
+    outcome  = factor(outcome), 
+    exp_med_out  = as.character(interaction(exposure, mediator, outcome, sep = ";"))
+    ) %>%
+  pivot_longer(
+    cols = matches("^(ACME|ADE|Total)_"),
+    names_to = c("effect", "cond", ".value"),
+    names_pattern = "^([^_]+)_([^_]+)_(.+)$"
+  ) %>%
+  mutate(
+    effect = factor(effect, levels = c("ACME", "ADE", "Total")),
+    cond   = factor(cond, levels = c("cond0", "cond1")),        # fct_recode(., "new" = "old")
+    exp_med_out_cond = factor(paste0(exp_med_out, ";", cond))
+  ) %>%
+  arrange(mediator)
+
+vns_shade_bands <- vns_ci_plt %>%
+  group_by(mediator) %>% 
+  arrange(by = mediator) %>%
+  mutate(
+    band_id = as.numeric(mediator),
+    fill = ifelse(band_id %% 2 == 1, "grey95", "transparent")
+    )
+
+line_data <- data.frame(
+  col_group = c("cond0", "cond1"),
+  x_center  = c(0, 0) # These are your "centers"
+)
+```
+
+```{r, fig.width = 7, fig.height = 3.5}
+vns_cond <- c("Blast (-)", "Blast (+)")
+
+vns_plt <- ggplot(vns_ci_plt, aes(x = est, y = effect, color = effect)) +
+  geom_rect(data = vns_shade_bands, aes(
+      xmin = -Inf, xmax = Inf,
+      ymin = -Inf, ymax = Inf,
+      fill = fill
+      ), inherit.aes = FALSE, color = NA) +
+  geom_point(size = 1.5) +
+  geom_linerange(aes(xmin = lower, xmax = upper), linewidth = 0.4) +
+  scale_fill_identity() +
+  scale_color_manual(values = effect_colors) +
+  facet_grid(
+    rows = vars(mediator), # if multiple exposure/outcomes, use exp_med_out
+    cols   = vars(cond),
+    labeller = labeller(
+      cond = c("cond0" = "Blast (-)", "cond1" = "Blast (+)"),
+      mediator = as_labeller(format_mediator_labels)
+      ),
+    space  = "free_y"
+    ) +
+  scale_x_continuous(limits = c(-ci_absmax, ci_absmax)) +
+  labs(x = NULL, y = NULL) +
+  guides(fill = guide_legend(reverse = TRUE)) +
+  
+  geom_vline(data = line_data, 
+             aes(xintercept = x_center), 
+             linetype = "dashed", 
+             color = "darkgrey", 
+             size = 0.5, alpha = 0.5) +
+  
+  theme_minimal(base_size = 14) +
+  theme(
+    strip.placement   = "outside",
+    panel.spacing.y   = unit(0.1, "lines"),   # try 1-3 "lines" of spacing
+    panel.spacing.x   = unit(0.1, "lines"),   # put close together
+    axis.text.y       = element_blank(),
+    axis.ticks.y      = element_blank(),
+    axis.ticks.x      = element_line(color = "black", linewidth = 0.3),
+    axis.line.x       = element_line(colour = "black", linewidth = 0.4),
+    panel.grid        = element_blank(),
+    panel.background  = element_blank()
+  )
+
+vns_plt1 <- vns_plt + theme(
+  legend.position    = "none",
+  strip.text.y.right = element_markdown(
+    angle = 0, margin = margin(l = 4, unit = "pt"), hjust = 0
+    ),
+  strip.text.x.top = element_text()
+  )
+
+vns_plt1
+```
+
+Save both
+```{r}
+row_height  <- 0.5
+panel_width <- 2
+
+# 1. Calculate heights
+h1 <- nlevels(blast_shade_bands$mediator) * row_height
+h2 <- nlevels(vns_shade_bands$mediator) * row_height
+
+combined_plot <- vns_plt1 / blast_plt1 +
+  plot_layout(heights = c(h2, h1))
+```
+
+```{r, fig.width = 7, fig.height = 3.1}
+print(combined_plot)
+```
+
+```{r}
+pdf_width <- (panel_width * 2) + 3  # add wiggle room for row labels
+pdf_height <- h1 + h2 + 1 # add wiggle room for column labels + x-axis text
+
+# Open PDF with TOTAL height
+pdf("../figures/A_CIs_combined.pdf",
+    width = pdf_width,
+    height = pdf_height) # Sum of heights
+
+print(combined_plot)
+plot(blast_legend_only)
+dev.off()
+```

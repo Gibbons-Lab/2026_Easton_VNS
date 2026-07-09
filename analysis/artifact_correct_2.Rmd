@@ -1,0 +1,778 @@
+---
+title: "artifact_correct_2.Rmd"
+author: "Alyssa N. Easton"
+date: '2025-12-04'
+output:
+---
+
+I figured out in `artifact_correct.Rmd` that if I don't want to drop the sparse samples,
+then I control for spurious hits *best* (get < 20) by doing the following: 
+  1. Do filtering FIRST (before CLR)
+  2.  use stricter total and batch prevalence thresholds (0.25 and 0.1)
+  3. Do filter on batch R2 (?), though this only dropped 1 (spurious) taxon.
+      *Maybe I could drop more with a slightly stronger filter.* 
+  4. Impute zeroes with GBM rather than CZM (drops 1 bad bug, again)
+  5. DO control for batch
+
+Also, all of the zeroes associated with treatment are significantly associated with *n_obs*, meaning I can correct for this?
+# Getting Started
+## Setup
+```{r "setup", include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache=TRUE)
+knitr::opts_knit$set(root.dir = file.path(Sys.getenv("VNS_ROOT"), "data"))  # stored VNS_ROOT in ~/.Renviron
+options(expressions = 6000)  # Increase allowed recursion depth
+options(digits = 10) ## Formats output to 10 digits
+library(magrittr)
+library(tidyverse)
+library(broom)
+library(broom.helpers)
+library(rlang)
+library(glue)
+library(janitor)
+library(purrr)
+library(ggh4x)
+library(zCompositions)
+library(parallel)
+library(pbapply)
+library(furrr)      # future_pmap comes from here
+library(future)
+library(limma)
+library(ggeffects)
+library(patchwork)
+source("./functions/mdact.R")
+source("./functions/june_functions.R")
+source("./functions/shannon_div_functions.R")
+source("./functions/artifact_correct_functions.R")
+```
+
+## Import and preprocess data
+    metadata, microbe presence/absence, sample-wise presence/absence, batch-wise presence/absence
+    compile into a summary `bug_info`
+```{r}
+# read in important data
+all_data <- readRDS("/proj/gibbons/2024_easton_vns/data/1_preprocessed/species_october.rds")
+
+presence_df <- all_data$a_counts %>%
+  mutate(across(everything(), ~ . != 0)) %>%
+  rownames_to_column("seq_name")
+
+per_sample_presence <- all_data$a_counts %>%
+  mutate(across(everything(), ~ . != 0)) %>%
+  {rowSums(.) / ncol(.)}
+
+bad_meta <- readRDS("/proj/gibbons/2024_easton_vns/data/mediation/lm_3var_pres25_metadata.rds")
+
+# Get presence by sample, and summarize by batch.
+# Also make filters for presence ≥ 25% and each batch presence > 0%
+
+presence_by_batch <- all_data$a_meta %>%
+  transmute(seq_name, Round_main) %>%
+  left_join(presence_df, by = "seq_name") %>%
+  column_to_rownames("seq_name") %>%
+  presence_by_category(     # defined in shannon_div_functions
+    data = .,
+    category_col = "Round_main"
+  )
+
+bug_info <- presence_df %>%
+  dplyr::select(-seq_name) %>%
+  summarize(across(everything(), ~ sum(.x) / n())) %>% # calculate total presence
+  pivot_longer(
+    everything(),
+    names_to = "microbe",
+    values_to = "pres_total"
+  ) %>%
+  left_join(presence_by_batch, by = "microbe") %>%
+  rename(
+    pres_batch1 = `1`,
+    pres_batch3 = `3`
+  )
+```
+
+## Get R2 of *relative abundances* by batch, treatment group, and richness
+    So I can add that into `bug_info`
+```{r}
+all_relab <- all_data$a_counts / rowSums(all_data$a_counts)
+
+# get R2 of relabund ~ variable
+if (all(rownames(all_relab) == all_data$a_meta$seq_name)) {
+  batch_r2 <- sapply(all_relab, function(y) get_r2(y, all_data$a_meta$Round_main))
+  trt_r2   <- sapply(all_relab, function(y) get_r2(y, all_data$a_meta$inj_trt_group))
+} else {
+  message("Sample IDs not matched")
+}
+
+# get R2 of relabund ~ missingness
+if(all(names(per_sample_presence) == all_data$a_meta$seq_name)) {
+  zero_frac_r2 <- sapply(all_relab, function(y) get_r2(y, per_sample_presence))
+}
+
+# combine into one df
+r2_info <- tibble(                 # get r2 of batch and treatment
+  microbe        = colnames(all_relab),
+  batch_r2       = batch_r2,
+  trt_r2         = trt_r2,
+  missingness_r2 = zero_frac_r2,
+  relab_var      = apply(all_relab, 2, var)
+)
+
+if (! "trt_r2" %in% (colnames(bug_info))) { # don't 
+  bug_info <- bug_info %>%
+    left_join(r2_info, by = "microbe")
+}
+
+head(bug_info)
+saveRDS(bug_info, "./A_bug_info.rds")
+```
+
+
+# Run a few different preprocessing schemes
+I ended up using something similar to run1, but with more batch R2 filtering. What did this actually do to my data in terms of real and "zero-hits", and their p-value distributions?
+
+*I ran M-DACT WITH run1 preprocessing parameters at FDR 0.15, batch filtering at 0.20*
+mdact_df <- readRDS("/proj/gibbons/2024_easton_vns/data/mediation/mdact_lm_1222_batch25_fdr15_df.rds")
+```{r}
+run0 <- artifact_catch_1(
+  total_presence      = 0.25,
+  batch_presence      = 0.10,
+  batch_r2_max        = 0.25,
+  impute_method       = "GBM",
+  drop_sparse_samples = FALSE,
+  filt_before_clr     = TRUE,
+  ctrl_batch          = TRUE
+)
+
+run1 <- artifact_catch_1(
+  total_presence      = 0.25,
+  batch_presence      = 0.10,
+  batch_r2_max        = 0.40,
+  impute_method       = "GBM",
+  drop_sparse_samples = FALSE,
+  filt_before_clr     = TRUE,
+  ctrl_batch          = TRUE
+)
+
+run2 <- artifact_catch_1(
+  total_presence      = 0.30,
+  batch_presence      = 0.10,
+  batch_r2_max        = 0.40,
+  impute_method       = "GBM",
+  drop_sparse_samples = TRUE,
+  filt_before_clr     = TRUE,
+  ctrl_batch          = TRUE
+)
+```
+
+## Consider run3, where I drop "Sham + VNS" group so I could exclude "VNS" from regression
+In terms of n:variable ratio, we would then have...
+```{r}
+# three_groups <- all_data$a_meta %>%
+#     filter(seq_name %in% run$merged_zero_clr_data$seq_name)
+
+filt_bugs <- bug_info %>% filter(
+  pres_total     >= 0.30,
+  pres_batch1    >= 0.10,
+  pres_batch3    >= 0.10,
+  batch_r2       <= 0.40,
+  missingness_r2 <= 1,
+  trt_r2         <= 1,
+  relab_var      <= 1
+  ) %>%
+  pull(microbe)
+  
+filt_counts <- all_data$a_counts %>%
+  dplyr::select(any_of(filt_bugs))
+
+# drop sparse samples
+filt_bug_presence <- all_data$a_counts %>%
+  mutate(across(everything(), ~ . != 0)) %>%
+  dplyr::select(any_of(filt_bugs)) %>%
+  {rowSums(.) / ncol(.)}
+
+group_assignment <- all_data$a_meta$inj_trt_group
+names(group_assignment) <- all_data$a_meta$seq_name
+
+# while we're at it, drop ALL samples that are in Sham + VNS group
+include_samples <- names(group_assignment)[(filt_bug_presence > 0.2) & (group_assignment != "Sham + VNS")]
+filt_counts <- filt_counts[rownames(filt_counts) %in% include_samples, ]  # 21 obs
+metadata <- all_data$a_meta[all_data$a_meta$seq_name %in% include_samples, ]
+per_sample_presence <- per_sample_presence[names(per_sample_presence) %in% include_samples]
+
+imputed_counts <- cmultRepl(filt_counts, label = 0, method = "GBM", z.delete = FALSE)
+gm <- exp(rowMeans(log(imputed_counts)))
+clr_mat <- log(imputed_counts) - log(gm)
+
+clr_df <- as_tibble(clr_mat)
+colnames(clr_df) <- colnames(filt_counts)
+
+is_zero <- filt_counts == 0
+
+# Masking to replace elements (e.g., with 0)
+clr_mat_zerocounts <- clr_df
+clr_mat_zerocounts[is_zero == FALSE] <- NA
+clr_df_zerocounts <- as_tibble(clr_mat_zerocounts)
+
+clr_mat_obscounts <- clr_df
+clr_mat_obscounts[is_zero == TRUE]   <- NA
+clr_df_obscounts <- as_tibble(clr_mat_obscounts)
+
+rownames(clr_df) <- rownames(filt_counts)
+rownames(clr_df_zerocounts) <- rownames(clr_df)
+rownames(clr_df_obscounts)  <- rownames(clr_df)
+
+merged_data <- clr_df_zerocounts %>%
+  rownames_to_column("seq_name") %>%
+  left_join(metadata %>%
+              dplyr::select(c("blast", "vns", "blast_and_vns", "seq_name", "Round_main")),
+            by = "seq_name")
+
+if (all(names(per_sample_presence) == merged_data$seq_name)) {
+  merged_data$sparsity <- per_sample_presence
+} else (
+  message("all(names(per_sample_presence) == merged_data$seq_name) NOT TRUE!!!")
+)
+
+zero_clr_reg <- map_dfr(filt_bugs, function(bug_name) { # assumes all names in filt_bugs made it through
+  
+  form <- as.formula(paste0(bug_name, " ~ blast + blast_and_vns + Round_main"))
+  terms <-             c("(Intercept)", "blast", "blast_and_vns", "Round_main")
+
+  # count non-missing samples for this bug
+  n_samples <- sum(!is.na(clr_df_zerocounts[[bug_name]]))
+  tryCatch({
+    model <- lm(form, data = merged_data)
+    bind_cols(
+      tidy(model),
+      glance(model) %>% dplyr::select(r.squared, adj.r.squared)
+    ) %>%
+      mutate(
+        microbe = bug_name,
+        n = n_samples
+      )
+  }, error = function(e) {
+    tibble(
+      term      = terms,
+      estimate  = NA_real_,
+      std.error = NA_real_,
+      statistic = NA_real_,
+      p.value   = NA_real_,
+      r.squared = NA_real_,
+      adj.r.squared = NA_real_,
+      microbe   = bug_name,
+      n         = n_samples   # (renamed from n_zero to match upstream)
+    )
+  })
+})
+
+# also calculate regression terms of (microbe CLR value ~ sparsity) for zeroes
+zero_clr_sparsity <- map_dfr(filt_bugs, function(bug_name) {
+  form <- as.formula(paste0(bug_name, " ~ sparsity + Round_main"))
+  terms <-              c("(Intercept)", "sparsity", "Round_main")
+  
+  n_samples <- sum(!is.na(clr_df_zerocounts[[bug_name]]))
+  
+  tryCatch({
+    model <- lm(form, data = merged_data)
+    bind_cols(
+      tidy(model),
+      glance(model) %>% dplyr::select(r.squared, adj.r.squared)
+    ) %>%
+      mutate(microbe = bug_name, n = n_samples)
+  }, error = function(e) {
+    tibble(
+      term      = terms,
+      estimate  = NA_real_,
+      std.error = NA_real_,
+      statistic = NA_real_,
+      p.value   = NA_real_,
+      r.squared = NA_real_,
+      adj.r.squared = NA_real_,
+      microbe   = bug_name,
+      n         = n_samples
+    )
+  })
+})
+
+spurious_hits <- zero_clr_reg %>%
+  filter(
+    term %in% c("blast", "vns", "blast_and_vns"),
+    p.value < 0.05
+    ) %>%
+  arrange(p.value)
+
+all_tests_spur <- zero_clr_reg %>%
+  filter(
+    !is.na(p.value),
+    term %in% c("blast", "vns", "blast_and_vns")
+    )
+
+test_stats <- list(
+  "total_tests" = length(all_tests_spur$p.value),
+  "total_spurious_tests" = length(all_tests_spur$p.value[all_tests_spur$p.value < 0.05]),
+  "total_blast_tests" = length(all_tests_spur$p.value[all_tests_spur$term == "blast"]),
+  "total_blast_spurious_tests" = length(all_tests_spur$p.value[(
+    all_tests_spur$p.value < 0.05 & all_tests_spur$term == "blast"
+    )])
+)
+
+test_stats$percent_tests_signif = test_stats$total_spurious_tests / test_stats$total_tests
+test_stats$percent_blast_signif = test_stats$total_blast_spurious_tests / test_stats$total_blast_tests
+
+sparsity_hits <- zero_clr_sparsity %>%
+  filter(
+    term %in% c("sparsity"),
+    r.squared > 0.25,
+    p.value < 0.05
+  ) %>%
+  arrange(p.value)
+
+run_summary <- tibble(
+  "total_presence" = 0.30,
+  "batch_presence" = 0.10,
+  "batch_r2_max"   = 0.40,
+  "nobs_r2"        = 1.00,
+  "injtrt_r2"      = 1.00,
+  "bug_variance"   = 1.00,
+  "impute_method"  = "GBM",
+  "drop_sparse_samples"  = TRUE,
+  "filt_before_clr" = TRUE,
+  "n_total_bugs"    = length(filt_bugs),
+  "n_spurious_bugs" = length(unique(spurious_hits$microbe)),
+  "n_spurious_hits" = nrow(spurious_hits),
+  "percent_tests_signif" = test_stats$percent_tests_signif,
+  "percent_blast_signif" = test_stats$percent_blast_signif,
+  "n_sparsity_hits" = nrow(sparsity_hits),
+  "both_spur_sparse"= length(intersect(unique(spurious_hits$microbe), unique(sparsity_hits$microbe))),
+  "ctrl_batch"     = TRUE
+)
+
+run3 <- list(
+  "all_results_trt" = zero_clr_reg,
+  "all_results_spar"= zero_clr_sparsity,
+  "spurious_hits"   = spurious_hits,
+  "sparsity_hits"   = sparsity_hits,
+  "spur_bug_vec"    = unique(spurious_hits$microbe),
+  "spar_bug_vec"    = unique(sparsity_hits$microbe),
+  "merged_zero_clr_data" = merged_data,
+  "all_clr_df"      = clr_df,
+  "summary"         = run_summary
+)
+
+```
+
+
+## Get zero-hits total and term-wise
+```{r}
+summarize_signif <- function(run, alpha = 0.05) {
+  tested <- run$all_results_trt %>%
+    filter(
+      !is.na(p.value),
+      term %in% c("blast", "vns", "blast_and_vns")
+    )
+
+  run$summary %>%
+    mutate(
+      percent_tests_signif = mean(tested$p.value < alpha),
+      percent_blast_signif = tested %>%
+        filter(term == "blast") %>%
+        summarize(mean(p.value < alpha), .groups = "drop") %>%
+        pull()
+    )
+}
+
+runs <- list("run0" = run0, "run1" = run1, "run2" = run2, "run3" = run3)
+summary_df <- map_dfr(runs, summarize_signif, .id = "run")
+
+zero_hit_df <- map_dfr(runs, ~ {
+  .x$spurious_hits
+  }, .id = "run") %>% arrange(p.value)
+
+head(summary_df)
+head(zero_hit_df)
+```
+
+## Flag "zero-hits" that actually only had 1-2 sample in one of the groups 
+
+function `n_pseudo` uses `run$merged_zero_clr_data` and `run$all_results_spar` to extract n_zero per group, then decide whether the significant "zero-hit" is valid (e.g. has at least 3 samples in both sides of the comparison for the given coefficient).
+
+This was previously `zero_info1`
+```{r}
+zeroinfo <- map(runs[1:3], ~ {
+  n_pseudo(.x)
+  }, .id = "run")
+
+head(zeroinfo$run1)
+```
+
+# Detour: Is zero-hit percentage a function of total ability to detect associations? 
+why is this happening if my filtering is similar? It's probably because the spurious signal is confounded by the highly-sparse samples, which have been removed. However, this may also be the case for true signal.
+
+OK so if I KEEP sparse samples, my FDR is ~6%  total, and ~15% for blast
+      if I DROP sparse samples, my FDR is ~23% total, and ~40% for blast
+
+This may just be an increased ability to detect associations at all, though?
+I would have to test to know for sure. 
+
+## Plot real hits by outcome
+```{r, fig.width = 5, fig.height = 4}
+# uses exposure_mediator_outcome from `acute_mediation_NEWEST.R`
+exposure_mediator_outcome <- readRDS("/proj/gibbons/2024_easton_vns/data/processed/exposure_mediator_outcome_A.rds")
+
+plot_outcome_bug("GGB29685_SGB42494", "acute_cyto_PC3", run1)
+plot_outcome_bug("Eubacteriaceae_bacterium", "acute_cyto_PC3", run1)
+plot_outcome_bug("GGB28431_SGB41014", "acute_cyto_PC3", run1)
+plot_outcome_bug("Lachnospiraceae_bacterium", "acute_cyto_PC3", run1)
+plot_outcome_bug("Clostridiaceae_bacterium", "acute_cyto_PC3", run1)
+```
+SGB41014 is an interesting one because although much of the presence/absence is split by group,
+the 3 Sham+VNS animals who have blast-like levels of this bug had lower PC3, consistent with the blast animals. 
+Similar thing for Lachnospiraceae; the sham animals with lower Lachno also have lower cyto PC3 than other members of their group. 
+
+## Plot real hit abundance by group
+```{r, fig.width = 10, fig.height = 4}
+plot_one_bug("bacterium_1XD42_1", run1) + theme(legend.position = "none") +
+plot_one_bug("bacterium_1XD42_1", run2) + theme(legend.position = "none") +
+plot_one_bug("GGB28456_SGB41039", run1) + theme(legend.position = "none")
+```
+*This is why I originally tried making run3* -> 
+Spot the difference: 2 *Sham + VNS* samples are dropped (one from each batch).
+> This severely limits our sample size for that group, but MAYYYYYBEEE we could just exclude it entirely?
+    e.g. `lm(microbe ~ blast + blast_and_vns + batch, data = three_groups)`
+
+
+This bug was flagged because in the zeroes, there is a strong NEGATIVE effect of blast.
+    > blast	estimate = -5.013678964
+
+But this sort of opposes the trend of presence/absence, where *all groups have a few zeros EXCEPT blast*
+So maybe this isn't concerning. 
+
+## Compare "zero-hits" from different runs 
+What about a spurious hit from run2? 
+```{r, fig.width = 5, eval = FALSE}
+plot_one_bug("Oscillospiraceae_unclassified_SGB43502", run0) + theme(legend.position = "none")
+plot_one_bug("Oscillospiraceae_unclassified_SGB43502", run1) + theme(legend.position = "none")
+plot_one_bug("Oscillospiraceae_unclassified_SGB43502", run2) + theme(legend.position = "none")
+plot_one_bug("Oscillospiraceae_unclassified_SGB43502", run3) + theme(legend.position = "none")
+```
+This one also had a strong negative correlation with Blast in the zeroes. But I honestly think this isn't necessarily wrong. The signal is negative because there is only one Sham + Sham animal without this bug, and it's "zero" looks higher because this bug is probably associated with alpha diversity. When we combine all the data (zeros + values), this single point doesn't cause that much bias. 
+
+### How about another bug - Lactobacillus johnsonii?
+```{r, fig.width = 15, fig.height = 6}
+# a <- plot_one_bug("Lactobacillus_johnsonii", run0) + theme(legend.position = "none") # LJ got filtered out here
+b <- plot_one_bug("Lactobacillus_johnsonii", run1) + theme(legend.position = "none")
+c <- plot_one_bug("Lactobacillus_johnsonii", run2) + theme(legend.position = "none")
+d <- plot_one_bug("Lactobacillus_johnsonii", run3) + theme(legend.position = "none")
+
+b + c + d
+```
+Which bugs in run1 got filtered out in run0 (by batch R2 cutoff at 25% instead of 40%)
+```{r}
+x <- colnames(run0$all_clr_df) # 98
+y <- colnames(run1$all_clr_df) # 118
+
+# setdiff(x, y)
+filt_by_batch25 <- setdiff(y, x) # bugs in run1 that aren't in run0
+filt_by_batch25
+```
+# Test actual results if I were to run `lm()` on these datasets
+Do regular regression (differential abundance) on entire thing
+```{r}
+DArun0 <- run_diffabund(run0, include_vns = TRUE)
+DArun1 <- run_diffabund(run1, include_vns = TRUE)
+DArun2 <- run_diffabund(run2, include_vns = TRUE)
+DArun3 <- run_diffabund(run3, include_vns = FALSE)
+```
+
+Now combine DA with zero-DA, as well as the group-wise n_zero, so I can compile information about how 
+```{r}
+run_bias <- list(
+  "run0" = runbias(run0, DArun0, zeroinfo$run0),
+  "run1" = runbias(run1, DArun1, zeroinfo$run1),
+  "run2" = runbias(run2, DArun2, zeroinfo$run2)
+)
+
+head(run_bias$run0)
+```
+Let's dig into what any of this means
+How many differently-abundant species may have signal driven by zeroes? Only ~3 for each.
+```{r}
+run_bias$run0 %>% filter(
+  zero_test_valid == TRUE,
+  adj.p.value      < 0.2,
+  zero_p.value     < 0.1
+  )
+
+run_bias$run1 %>% filter(
+  zero_test_valid == TRUE,
+  adj.p.value      < 0.2,
+  zero_p.value     < 0.1
+  )
+
+run_bias$run2 %>% filter(
+  zero_test_valid == TRUE,
+  adj.p.value      < 0.2,
+  zero_p.value     < 0.1
+  )
+```
+
+
+## In run 1, what is the overlap between hits and spurious hits? Are the zeroes driving the significant hits?
+```{r, fig.width = 15, fig.height = 6}
+bug_vec <- run_bias$run1 %>% filter(adj.p.value < 0.1) %>% pull(microbe) %>% unique()
+
+plots <- map(
+  bug_vec,
+  ~ plot_one_bug(.x, run1)
+) %>%
+  set_names(bug_vec)
+
+plots[[1]] + theme(legend.position = "none") + plots[[2]] + theme(legend.position = "none") + plots[[3]] + theme(legend.position = "none")
+```
+None of the run1 differential abundance hits had a significant (p.adj < 0.1) signal from the zeros (for the same term).
+
+How about run2?
+In run 1, what is the overlap between hits and spurious hits? Are the zeroes driving the significant hits?
+```{r, fig.width = 10, fig.height = 10}
+bug_vec <- run_bias$run2 %>% filter(adj.p.value < 0.1) %>% pull(microbe) %>% unique()
+plots <- map(bug_vec, ~ plot_one_bug(.x, run2)) %>% set_names(bug_vec)
+
+plots[[1]] + theme(legend.position = "none") + 
+  plots[[2]] + theme(legend.position = "none") + 
+  plots[[3]] + theme(legend.position = "none") +
+  plots[["Oscillospiraceae_unclassified_SGB43502"]] + theme(legend.position = "none")
+```
+Notably, only one of the hits from run2 had a significant signal from the zeros (for the same term) - 
+  > Oscillospiraceae_unclassified_SGB43502,
+  
+And the blast effect in the zeroes here isn't that strong, because there's only 1 sham/sham animal with 0 reads (so I'm not concerned about a major bias).
+
+```{r, fig.width = 5}
+# bug_vec <- run_bias$run3 %>% filter(adj.p.value < 0.1) %>% pull(microbe) %>% unique()
+# plots <- map(bug_vec, ~ plot_one_bug(.x, run2)) %>% set_names(bug_vec)
+# 
+# plots[[1]] + theme(legend.position = "none") + 
+#   plots[[2]] + theme(legend.position = "none") + 
+#   plots[[3]] + theme(legend.position = "none") +
+#   plots[["Oscillospiraceae_unclassified_SGB43502"]] + theme(legend.position = "none")
+colnames(run_bias$run0)
+```
+Again, only one of the run3 hits had a significant signal from the zeros
+(and it was the same one as run2 - Oscillospiraceae_unclassified_SGB43502, which didn't look concerning)
+
+Looking at the data, it _does_ look like there is a blast-induced depletion of Oscillospiraceae_unclassified_SGB43502, and very possibly a VNS rescue effect, but not enough to be significant.
+
+What are the actual p-values. Do we gain power with run3?
+DArun3 detects 7 
+
+## Compare p-values distributions between runs
+Compare p-value distributions for the zeros and full regressions
+```{r, fig.width = 10, fig.height = 10}
+plot_df <- run_bias$run0 %>%
+  transmute(term, p.value, microbe, zero_p.value, zero_test_valid) %>%
+  rename(
+    all = p.value,
+    zeroes = zero_p.value
+    ) %>%
+  pivot_longer(
+    cols = c("all", "zeroes"),
+    names_to = "dataset",
+    values_to = "p.value"
+  )
+
+ggplot(plot_df, aes(x = p.value)) +
+  geom_histogram(bins = 30, color = "white") +
+  facet_grid(term ~ dataset + zero_test_valid) +
+  labs(
+    x = "Run 0 p-value",
+    y = "Count"
+  ) + theme_bw()
+```
+
+```{r, fig.width = 10, fig.height = 10}
+plot_df <- run_bias$run1 %>%
+  transmute(term, p.value, microbe, zero_p.value, zero_test_valid) %>%
+  rename(
+    all = p.value,
+    zeroes = zero_p.value
+    ) %>%
+  pivot_longer(
+    cols = c("all", "zeroes"),
+    names_to = "dataset",
+    values_to = "p.value"
+  )
+
+ggplot(plot_df, aes(x = p.value)) +
+  geom_histogram(bins = 30, color = "white") +
+  facet_grid(term ~ dataset + zero_test_valid) +
+  labs(
+    x = "Run 1 p-value",
+    y = "Count"
+  ) + theme_bw()
+```
+
+plot the worst offenders (lowest zero_p.value) to see if they're actually concerning
+```{r, fig.width = 4}
+plot_one_bug("bacterium_1XD42_1", run1)
+plot_one_bug("GGB75053_SGB43494", run1)
+plot_one_bug("bacterium_1XD21_70", run1)
+plot_one_bug("GGB28382_SGB40962", run1)
+plot_one_bug("GGB30455_SGB43519", run1)
+plot_one_bug("Clostridium_cocleatum", run1)
+```
+1XD42_1 is actually dragging the whole Blast + VNS group down (zero beta_blast consistent with combined beta_blast?)
+
+Oscillospiraceae is a real signal, I think.
+1XD21_70 doesn't really follow a group-wise pattern in missingness (p_blast = 0.02, so it wouldn't pass FDR anyways)
+40986 only has 1 in blast and 1 in VNS, so I don't think we should include this.
+
+```{r, fig.width = 10, fig.height = 10}
+plot_df <- run_bias$run2 %>%
+  transmute(term, p.value, microbe, zero_p.value, zero_test_valid) %>%
+  rename(
+    all = p.value,
+    zeroes = zero_p.value
+    ) %>%
+  pivot_longer(
+    cols = c("all", "zeroes"),
+    names_to = "dataset",
+    values_to = "p.value"
+  )
+
+ggplot(plot_df, aes(x = p.value)) +
+  geom_histogram(bins = 30, color = "white") +
+  facet_grid(term ~ dataset + zero_test_valid) +
+  labs(
+    x = "Run 2 p-value",
+    y = "Count"
+  ) + theme_bw()
+```
+
+rate of zero-signal
+```{r}
+zero_signal <- run_bias$run0 %>% filter(zero_p.value < 0.05, zero_test_valid == TRUE)
+for (x in unique(zero_signal$term)) {
+  subdf <- zero_signal %>% filter(term == x)
+  print(subdf)
+}
+
+
+```
+run0 gives us 13 valid blast-zero associations (7 in the same direction as the full signal)
+This is 13/98 = 0.133 
+
+
+```{r}
+zero_signal <- run_bias$run1 %>% filter(zero_p.value < 0.05, zero_test_valid == TRUE)
+for (x in unique(zero_signal$term)) {
+  subdf <- zero_signal %>% filter(term == x)
+  print(subdf)
+}
+```
+So run0 gives us 12 valid (6 of these same-direction) blast-zero associations and 2 (both same direction) valid vns-zero associations.
+
+This is 12/118 = 0.102, so not that much different from run0...
+
+Let's look specifically at the bugs filtered out with batch R2
+```{r}
+batchfilt_info <- run_bias$run1 %>% filter(microbe %in% filt_by_batch25)
+hist(batchfilt_info %>% filter(term == "blast") %>% pull(p.value))
+hist(batchfilt_info %>% filter(term == "vns") %>% pull(p.value))
+hist(batchfilt_info %>% filter(term == "blast_and_vns") %>% pull(p.value))
+```
+I suspect that the blast_and_vns filtering is actually good (even though it is filtering out lower p-values) because those p-values may be low due to overspecification. There are so few mice that fall into blast_and_vns AND one batch or another 
+
+I think we just need to say the caveat that in the acute cohort, for the blast effect, we can't deconfound changes in microbial abundance completely from overall changes in alpha diversity, both in-general and especially for species that had a lot of missing observations (because zeroes then become almost purely a function of microbiome richness). However, this isn't necessarily a flaw - it's just a really broad-sweeping exposure, so we may not be able to isolate signal from individual components in the system without targeted perturbations experiments
+
+I do think run1 has the least zero-inflated p-value distribution of zeroes. Let's export the info from it to try M-DACT
+
+Can I re-get info on group-wise n per mediator? And which coefficient was significant?
+For example, if blast coefficient of zero abundances is significant, but there is only 1 sample in the sham-sham group, I don't want to count that as a spurious hit. 
+
+Wait a second... 
+```{r}
+run1$all_results_spar
+```
+
+```{r, eval=FALSE}
+run1$merged_all_clr_data <- run1$all_clr_df %>%
+  rownames_to_column("seq_name") %>%
+    left_join(
+      all_data$a_meta %>% dplyr::select(c("blast", "vns", "blast_and_vns", "seq_name", "Round_main")),
+      by = "seq_name"
+    )
+  
+# saveRDS(run1, file = "./run1_acute_parameters.rds")
+```
+
+# Check out M-DACT hits I got when I preprocessed according to "run1" 
+I ran M-DACT WITH run1 preprocessing parameters at FDR 0.15, batch filtering at 0.25
+readRDS("/proj/gibbons/2024_easton_vns/data/mediation/mdact_lm_1208_batchfilt_fdr02_df.rds")
+```{r, fig.width = 15, fig.height = 4}
+# mdact_df <- readRDS("/proj/gibbons/2024_easton_vns/data/mediation/mdact_lm_1208_batchfilt_fdr02_df.rds")
+mdact_df <- readRDS("/proj/gibbons/2024_easton_vns/data/mediation/mdact_lm_1222_batch25_fdr15_df.rds")
+
+# plot bugs of significant hits
+bug_hits <- mdact_df %>%
+  filter(fdr_sig == TRUE) %>%
+  pull(mediator) %>% unique()
+  
+mdact_hit_plots <- map(
+  bug_hits,
+  ~ plot_one_bug(.x, run0)
+) %>%
+  set_names(bug_hits)
+
+
+mdact_hit_plots$GGB29685_SGB42494 + theme(legend.position = "none") +
+  mdact_hit_plots$Lachnospiraceae_bacterium + theme(legend.position = "none") +
+  mdact_hit_plots$Eubacteriaceae_bacterium + theme(legend.position = "none")
+```
+How about residuals for these?
+```{r}
+a <- plot_resid_bug("GGB29685_SGB42494", "acute_cyto_PC3",  run0) + theme(legend.position = "none")
+b <- plot_resid_bug("Lachnospiraceae_bacterium", "acute_cyto_PC3",  run0) + theme(legend.position = "none")
+c <- plot_resid_bug("Eubacteriaceae_bacterium", "acute_cyto_PC3",  run0) + theme(legend.position = "none")
+# d <- plot_resid_bug("GGB28431_SGB41014", "acute_cyto_PC3",  run1) + theme(legend.position = "none")
+# e <- plot_resid_bug("Clostridiaceae_bacterium", "acute_cyto_PC3",  run1) + theme(legend.position = "none")
+
+a + b + c
+```
+
+These are all really the same signal. 
+
+```{r, fig.width = 10, fig.height = 7}
+mdact_df <- readRDS("/proj/gibbons/2024_easton_vns/data/mediation/mdact_lm_1208_batch20_fdr02_df.rds")
+
+# plot bugs of significant hits
+bug_hits <- mdact_df %>%
+  filter(fdr_sig == TRUE) %>%
+  pull(mediator) %>% unique()
+
+mdact_hit_plots <- map(
+  bug_hits,
+  ~ plot_one_bug(.x, run1)
+) %>%
+  set_names(bug_hits)
+
+
+(mdact_hit_plots$GGB29685_SGB42494 + theme(legend.position = "none") +
+  mdact_hit_plots$Lachnospiraceae_bacterium + theme(legend.position = "none") +
+  mdact_hit_plots$Eubacteriaceae_bacterium + theme(legend.position = "none")) /
+  (mdact_hit_plots$GGB28431_SGB41014 + theme(legend.position = "none") +
+  mdact_hit_plots$Clostridiaceae_bacterium + theme(legend.position = "none") + plot_spacer())
+
+a <- plot_resid_bug("GGB29685_SGB42494", "acute_cyto_PC3",  run1) + theme(legend.position = "none")
+b <- plot_resid_bug("Lachnospiraceae_bacterium", "acute_cyto_PC3",  run1) + theme(legend.position = "none")
+c <- plot_resid_bug("Eubacteriaceae_bacterium", "acute_cyto_PC3",  run1) + theme(legend.position = "none")
+d <- plot_resid_bug("GGB28431_SGB41014", "acute_cyto_PC3",  run1) + theme(legend.position = "none")
+e <- plot_resid_bug("Clostridiaceae_bacterium", "acute_cyto_PC3",  run1) + theme(legend.position = "none")
+
+(a + b + c) / (d + e + plot_spacer())
+```
+
+So within each group/batch, having more of these bugs was associated with higher PC3
+(except for 41014, which followed the opposite pattern). I think we can justify 41014
+because I'm pretty sure if we made it presence/absence p_M and p_Y would still be significant.
+
+It sort of looks like some hits are driven by an interaction effect between VNS and PC3
+(42494, Lachnospiraceae, Eubacteriaceae)

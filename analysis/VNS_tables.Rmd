@@ -1,0 +1,596 @@
+---
+title: "VNS_tables.Rmd"
+author: "Alyssa N. Easton"
+date: '2025-04-07'
+output:
+---
+
+Read in dataframes I saved as RDS, convert to excel spreadsheet format
+
+## Setup
+```{r "setup", include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache=TRUE)
+knitr::opts_knit$set(root.dir = file.path(Sys.getenv("VNS_ROOT"), "data"))  # stored VNS_ROOT in ~/.Renviron
+options(expressions = 6000)  # Increase allowed recursion depth
+options(digits = 4) ## Formats output to 10 digits
+library(magrittr)
+library(tidyverse)
+library(broom)
+library(broom.helpers)
+library(rlang)
+library(glue)
+library(janitor)
+library(purrr)
+library(ggeffects)
+library(patchwork)
+library(car)
+library(scales)
+library(future.apply)
+library(ComplexHeatmap)
+library(circlize)
+library(cowplot)
+library(Cairo)
+library(grid)
+library(gridExtra)
+library(ggtext)
+library(openxlsx)
+
+# source("/proj/gibbons/2024_easton_vns/workflow/functions/mdact.R")
+# source("/proj/gibbons/2024_easton_vns/workflow/functions/june_functions.R")
+# source("/proj/gibbons/2024_easton_vns/workflow/functions/shannon_div_functions.R")
+# source("/proj/gibbons/2024_easton_vns/workflow/functions/artifact_correct_functions.R")
+# source("/proj/gibbons/2024_easton_vns/workflow/functions/lmer_functions.R")
+source("/proj/gibbons/2024_easton_vns/workflow/functions/final_form_functions.R")
+all_data <- readRDS("/proj/gibbons/2024_easton_vns/data/1_preprocessed/species_october.rds")
+taxmap <- all_data$taxonomy_map %>%
+  transmute(Species, Genus, Family, Order, Class, Phylum, Kingdom, full_name)
+```
+
+# Start with part A
+```{r}
+model_microbe <- readRDS("../data/3_newest/A_microbe_models_0212.rds") # LRT p-values
+model_outcome <- readRDS("../data/3_newest/A_outcome_models_0212.rds")  # LRT p-values (should be equivalent to coef_df)
+coef_df <- readRDS("../data/3_newest/A_microbe_coef_dfs_0218.rds")   # full lm() model specifications for M and Y
+all_run_df <- readRDS("../data/3_newest/A_mediation_0212.rds")
+ci_df <- readRDS("../data/3_newest/A_bootCI_df_0212.rds")
+
+coef_microbe <- readRDS("../data/3_newest/A_microbe_coef_pvals_0206.rds") # regular coefficient p-values
+coef_outcome <- readRDS("../data/3_newest/A_outcome_coef_pvals_0206.rds") # regular coef p-vals
+```
+
+
+```{r}
+colnames(model_microbe) 
+colnames(coef_microbe)
+```
+
+```{r}
+# mod_M <- model_microbe %>%
+#   transmute(term, estimate, "SE" = std.error, "F" = statistic, "Pr(>F)" = p.value, microbe, "n_samples" = n, "Adjusted p" = adj.p)
+
+ttest_m <- coef_microbe %>%
+  transmute(microbe, term, "est"= estimate, "se" = std.error, "t" = statistic, "t_p" = p.value, "t_q" = adj.p) %>%
+  mutate(term = case_when(
+    term == "blast_and_vns" ~ "interact",
+    term == "(Intercept)" ~ "intercept",
+    term == "Round_main3" ~ "batch",
+    .default = term
+    )) %>% 
+  pivot_wider(
+    id_cols = microbe,
+    names_from = term,
+    values_from = c("est", "se", "t", "t_p", "t_q"),
+    names_glue =  "{.value}_{term}"
+  ) %>% 
+  dplyr::select(-t_q_intercept)
+
+all_m <- model_microbe %>%
+  transmute(microbe, term, "LRT_F" = statistic, "LRT_p" = p.value, n, "LRT_q" = adj.p) %>%
+  mutate(term = ifelse(term == "blast_and_vns", "interact", term)) %>% 
+  pivot_wider(
+    id_cols = c(microbe, n),
+    names_from = term,
+    values_from = c("LRT_F", "LRT_p", "LRT_q"),
+    names_glue =  "{.value}_{term}"
+  ) %>%
+  left_join(ttest_m, by = "microbe") %>%
+  rename(Species = microbe) %>%
+  arrange(Species) %>%
+  left_join(taxmap, by = "Species") %>%
+  mutate(Species = case_when(
+    Species == "berger_parker" ~ "Berger Parker Index",
+    Species == "richness" ~ "Richness (# observed features)",
+    Species == "shannon" ~ "Shannon Index",
+    .default = Species
+  ))
+
+all_m
+```
+
+one row for each model M regression.
+n=27 for all of these. I can just write that somewhere. 
+F(blast) and F(VNS) are df=2, and F(interact) is df=1
+
+```{r}
+ttest_y <- coef_outcome %>%
+  map_dfr(function(one) {
+    one %>%
+      mutate(outcome = unique(one$outcome))
+  }) %>%
+  transmute(
+    outcome, microbe, term, "est" = estimate, "se" = std.error,
+    "t" = statistic, "t_p" = p.value, "t_q" = adj.p
+    ) %>%
+  mutate(
+    term = case_when(
+    term == "blast_and_vns" ~ "interact",
+    term == "(Intercept)" ~ "intercept",
+    term == "Round_main3" ~ "batch",
+    .default = term
+      )) %>% 
+  pivot_wider(
+    id_cols = c("outcome", "microbe"),
+    names_from = term,
+    values_from = c("est", "se", "t", "t_p", "t_q"),
+    names_glue =  "{.value}_{term}"
+  ) %>%
+  dplyr::select(-t_q_intercept)
+
+ttest_y
+```
+
+```{r}
+all_y <- model_outcome %>%
+  map_dfr(function(one) {
+    one %>%
+      mutate(outcome = unique(one$outcome))
+  }) %>%
+  transmute(outcome, microbe, term, "LRT_F" = statistic, "LRT_p" = p.value, n, "LRT_q" = adj.p) %>%
+  filter(term == "microbe") %>%
+  pivot_wider(
+    id_cols = c(outcome, microbe, n),
+    names_from = term,
+    values_from = c("LRT_F", "LRT_p", "LRT_q"),
+    names_glue =  "{.value}_{term}"
+  ) %>%
+  left_join(ttest_y, by = c("outcome", "microbe")) %>%
+  rename(Species = microbe) %>%
+  arrange(outcome, Species) %>%
+  left_join(taxmap, by = "Species") %>%
+  mutate(Species = case_when(
+    Species == "berger_parker" ~ "Berger Parker Index",
+    Species == "richness" ~ "Richness (# observed features)",
+    Species == "shannon" ~ "Shannon Index",
+    .default = Species
+  ))
+
+all_y %>% transmute(outcome, Species, LRT_p_microbe, t_p_microbe) # LRT p-value is equivalent to coefficient p-value here.
+```
+
+Now onto M-DACT results
+```{r}
+mdact <- all_run_df %>%
+  transmute(
+    exposure, mediator, outcome, p_m, p_y, p_composite, dact_stat, dact_thr_10, dact_thr_15, dact_thr_20, signif_at
+  ) %>%
+  mutate(
+    exposure = ifelse(exposure == "pm_blast", "blast", "vns"),
+    Species = mediator
+    ) %>%
+  arrange(outcome, mediator, exposure) %>%
+  left_join(taxmap, by = "Species") %>%
+  mutate(mediator = case_when(
+    mediator == "berger_parker" ~ "Berger Parker Index",
+    mediator == "richness" ~ "Richness (# observed features)",
+    mediator == "shannon" ~ "Shannon Index",
+    .default = mediator
+  ))
+
+# mdact %>% filter(signif_at == 0.250)
+
+mdact
+```
+```{r}
+mdact %>% filter(mediator == "Shannon Index")
+```
+
+Finally, the CI df
+```{r}
+acme <- ci_df %>%
+  transmute(
+    exposure, mediator, outcome,
+    ACME_cond0_lower, ACME_cond0_est, ACME_cond0_upper,
+    ADE_cond0_lower, ADE_cond0_est, ADE_cond0_upper,
+    Total_cond0_lower, Total_cond0_est, Total_cond0_upper,
+    ACME_cond1_lower, ACME_cond1_est, ACME_cond1_upper,
+    ADE_cond1_lower, ADE_cond1_est, ADE_cond1_upper,
+    Total_cond1_lower, Total_cond1_est, Total_cond1_upper
+  )
+
+acme
+```
+
+```{r}
+ci_blast <- acme %>% filter(exposure == "blast") %>%
+  mutate(
+    `ACME (VNS-)` = paste0("[", round(ACME_cond0_lower, 3), ", ", round(ACME_cond0_upper, 3), "]"),
+    `ADE (VNS-)` = paste0("[", round(ADE_cond0_lower, 3), ", ", round(ADE_cond0_upper, 3), "]"),
+    `Total (VNS-)`= paste0("[", round(Total_cond0_lower, 3), ", ", round(Total_cond0_upper, 3), "]"),
+    `ACME (VNS+)` = paste0("[", round(ACME_cond1_lower, 3), ", ", round(ACME_cond1_upper, 3), "]"),
+    `ADE (VNS+)` = paste0("[", round(ADE_cond1_lower, 3), ", ", round(ADE_cond1_upper, 3), "]"),
+    `Total (VNS+)`= paste0("[", round(Total_cond1_lower, 3), ", ", round(Total_cond1_upper, 3), "]")
+  ) %>%
+  transmute(exposure, mediator, outcome,
+            `ACME (VNS-)`, `ADE (VNS-)`, `Total (VNS-)`,
+            `ACME (VNS+)`, `ADE (VNS+)`, `Total (VNS+)`
+  )
+
+ci_vns <- acme %>% filter(exposure == "vns") %>%
+  mutate(
+    `ACME (Blast-)` = paste0("[", round(ACME_cond0_lower, 3), ", ", round(ACME_cond0_upper, 3), "]"),
+    `ADE (Blast-)` = paste0("[", round(ADE_cond0_lower, 3), ", ", round(ADE_cond0_upper, 3), "]"),
+    `Total (Blast-)`= paste0("[", round(Total_cond0_lower, 3), ", ", round(Total_cond0_upper, 3), "]"),
+    `ACME (Blast+)` = paste0("[", round(ACME_cond1_lower, 3), ", ", round(ACME_cond1_upper, 3), "]"),
+    `ADE (Blast+)` = paste0("[", round(ADE_cond1_lower, 3), ", ", round(ADE_cond1_upper, 3), "]"),
+    `Total (Blast+)`= paste0("[", round(Total_cond1_lower, 3), ", ", round(Total_cond1_upper, 3), "]")
+  ) %>%
+  transmute(exposure, mediator, outcome,
+            `ACME (Blast-)`, `ADE (Blast-)`, `Total (Blast-)`,
+            `ACME (Blast+)`, `ADE (Blast+)`, `Total (Blast+)`
+  )
+
+
+ci_blast
+ci_vns
+```
+
+```{r}
+a_tables <- list(
+  "lm_m" = all_m,
+  "lm_y" = all_y,
+  "mdact_mediation" = mdact,
+  "acme_estimation" = acme, 
+  "blast_ci" = ci_blast,
+  "vns_ci" = ci_vns
+)
+```
+
+
+# Repeat for cohort B things
+```{r}
+model_microbe <- readRDS("../data/3_newest/B_microbe_models_0216.rds") # LRT p-values
+model_outcome <- readRDS("../data/3_newest/B_outcome_models_0216.rds")  # LRT p-values (should be equivalent to coef_df)
+coef_df <- readRDS("../data/3_newest/B_microbe_coef_dfs_0217.rds")   # full lm() model specifications for M and Y
+all_run_df <- readRDS("../data/3_newest/B_mediation_0216.rds")
+ci_df <- readRDS("../data/3_newest/B_bootCI_df_0216.rds")
+
+coef_microbe <- readRDS("../data/3_newest/B_microbe_coef_pvals_0216.rds") # regular coefficient p-values
+coef_outcome <- readRDS("../data/3_newest/B_outcome_coefs_0216.rds") # regular coef p-vals
+```
+
+
+```{r}
+colnames(model_microbe) 
+colnames(coef_microbe)
+
+model_microbe
+coef_microbe
+```
+
+```{r}
+# mod_M <- model_microbe %>%
+#   transmute(term, estimate, "SE" = std.error, "F" = statistic, "Pr(>F)" = p.value, microbe, "n_samples" = n, "Adjusted p" = adj.p)
+
+ttest_m <- coef_microbe %>%
+  transmute(microbe, term, "est"= estimate, "se" = std.error, "t" = statistic, "t_p" = p.value, "t_q" = adj.p) %>%
+  mutate(term = case_when(
+    term == "blast_and_vns" ~ "interact",
+    term == "(Intercept)" ~ "intercept",
+    term == "Round_main3" ~ "batch",     # there is no main term for batch here because it was a random effect
+    .default = term
+    )) %>% 
+  pivot_wider(
+    id_cols = microbe,
+    names_from = term,
+    values_from = c("est", "se", "t", "t_p", "t_q"),
+    names_glue =  "{.value}_{term}"
+  ) %>% 
+  dplyr::select(-t_q_intercept)
+
+all_m <- model_microbe %>%
+  transmute(microbe, term, "LRT_F" = statistic, "LRT_p" = p.value, n, "LRT_q" = adj.p) %>%
+  mutate(term = ifelse(term == "blast_and_vns", "interact", term)) %>% 
+  pivot_wider(
+    id_cols = c(microbe, n),
+    names_from = term,
+    values_from = c("LRT_F", "LRT_p", "LRT_q"),
+    names_glue =  "{.value}_{term}"
+  ) %>%
+  left_join(ttest_m, by = "microbe") %>%
+  rename(Species = microbe) %>%
+  arrange(Species) %>%
+  left_join(taxmap, by = "Species") %>%
+  mutate(Species = case_when(
+    Species == "berger_parker" ~ "Berger Parker Index",
+    Species == "richness" ~ "Richness (# observed features)",
+    Species == "shannon" ~ "Shannon Index",
+    .default = Species
+  ))
+
+all_m
+```
+
+
+```{r}
+ttest_y <- coef_outcome %>%
+  map_dfr(function(one) {
+    one %>%
+      mutate(outcome = unique(one$outcome))
+  }) %>%
+  transmute(
+    outcome, microbe, term, "est" = estimate, "se" = std.error,
+    "t" = statistic, "t_p" = p.value, "t_q" = adj.p
+    ) %>%
+  mutate(
+    term = case_when(
+    term == "blast_and_vns" ~ "interact",
+    term == "(Intercept)" ~ "intercept",      # I don't seem to have intercept coefficients saved here
+    term == "Round_main3" ~ "batch",
+    .default = term
+      )) %>% 
+  pivot_wider(
+    id_cols = c("outcome", "microbe"),
+    names_from = term,
+    values_from = c("est", "se", "t", "t_p", "t_q"),
+    names_glue =  "{.value}_{term}"
+  )
+
+ttest_y
+```
+
+```{r}
+all_y <- model_outcome %>%
+  map_dfr(function(one) {
+    one %>%
+      mutate(outcome = unique(one$outcome))
+  }) %>%
+  transmute(outcome, microbe, term, "LRT_Chi" = statistic, "LRT_p" = p.value, n, "LRT_q" = adj.p) %>%
+  filter(term == "microbe") %>%
+  pivot_wider(
+    id_cols = c(outcome, microbe, n),
+    names_from = term,
+    values_from = c("LRT_Chi", "LRT_p", "LRT_q"),
+    names_glue =  "{.value}_{term}"
+  ) %>%
+  left_join(ttest_y, by = c("outcome", "microbe")) %>%
+  rename(Species = microbe) %>%
+  arrange(outcome, Species) %>%
+  left_join(taxmap, by = "Species") %>%
+  mutate(Species = case_when(
+    Species == "berger_parker" ~ "Berger Parker Index",
+    Species == "richness" ~ "Richness (# observed features)",
+    Species == "shannon" ~ "Shannon Index",
+    .default = Species
+  ))
+
+all_y %>% transmute(outcome, Species, LRT_p_microbe, t_p_microbe) # LRT p-value is equivalent to coefficient p-value here.
+```
+
+The LRT p-values are just slightly different from the lmer p-values, maybe because they're Swatterwaithe vs. Chi (asymptotically equivalent), as opposed to Student's t-test vs. F, which are the same? But they're close enough that it really doesn't matter. 
+
+Now onto M-DACT results
+```{r}
+mdact <- all_run_df %>%
+  transmute(
+    exposure, mediator, outcome, p_m, p_y, p_composite, dact_stat, dact_thr_10, dact_thr_15, dact_thr_20, signif_at
+  ) %>%
+  mutate(
+    exposure = ifelse(exposure == "pm_blast", "blast", "vns"),
+    Species = mediator
+    ) %>%
+  arrange(outcome, mediator, exposure) %>%
+  left_join(taxmap, by = "Species") %>%
+  mutate(mediator = case_when(
+    mediator == "berger_parker" ~ "Berger Parker Index",
+    mediator == "richness" ~ "Richness (# observed features)",
+    mediator == "shannon" ~ "Shannon Index",
+    .default = mediator
+  ))
+
+# mdact %>% filter(signif_at == 0.250)
+
+mdact
+```
+
+
+```{r}
+mdact %>% filter(!is.na(signif_at))
+```
+
+Finally, the CI df
+```{r}
+acme <- ci_df %>%
+  transmute(
+    exposure, mediator, outcome,
+    ACME_cond0_lower, ACME_cond0_est, ACME_cond0_upper,
+    ADE_cond0_lower, ADE_cond0_est, ADE_cond0_upper,
+    Total_cond0_lower, Total_cond0_est, Total_cond0_upper,
+    ACME_cond1_lower, ACME_cond1_est, ACME_cond1_upper,
+    ADE_cond1_lower, ADE_cond1_est, ADE_cond1_upper,
+    Total_cond1_lower, Total_cond1_est, Total_cond1_upper
+  ) %>%
+  arrange(outcome, mediator, exposure) %>%
+  mutate(Species = mediator) %>% left_join(taxmap, by = "Species") %>%
+  mutate(mediator = case_when(
+    mediator == "berger_parker" ~ "Berger Parker Index",
+    mediator == "richness" ~ "Richness (# observed features)",
+    mediator == "shannon" ~ "Shannon Index",
+    .default = mediator
+  )) %>%
+  dplyr::select(-Species)
+
+ci_blast <- acme %>% filter(exposure == "blast") %>%
+  mutate(
+    `ACME (VNS-)` = paste0("[", round(ACME_cond0_lower, 3), ", ", round(ACME_cond0_upper, 3), "]"),
+    `ADE (VNS-)` = paste0("[", round(ADE_cond0_lower, 3), ", ", round(ADE_cond0_upper, 3), "]"),
+    `Total (VNS-)`= paste0("[", round(Total_cond0_lower, 3), ", ", round(Total_cond0_upper, 3), "]"),
+    `ACME (VNS+)` = paste0("[", round(ACME_cond1_lower, 3), ", ", round(ACME_cond1_upper, 3), "]"),
+    `ADE (VNS+)` = paste0("[", round(ADE_cond1_lower, 3), ", ", round(ADE_cond1_upper, 3), "]"),
+    `Total (VNS+)`= paste0("[", round(Total_cond1_lower, 3), ", ", round(Total_cond1_upper, 3), "]")
+  ) %>%
+  transmute(
+    exposure, mediator, outcome,
+    `ACME (VNS-)`, `ADE (VNS-)`, `Total (VNS-)`,
+    `ACME (VNS+)`, `ADE (VNS+)`, `Total (VNS+)`,
+    Genus, Family, Order, Class, Phylum, Kingdom, full_name
+  )
+
+ci_vns <- acme %>% filter(exposure == "vns") %>%
+  mutate(
+    `ACME (Blast-)` = paste0("[", round(ACME_cond0_lower, 3), ", ", round(ACME_cond0_upper, 3), "]"),
+    `ADE (Blast-)` = paste0("[", round(ADE_cond0_lower, 3), ", ", round(ADE_cond0_upper, 3), "]"),
+    `Total (Blast-)`= paste0("[", round(Total_cond0_lower, 3), ", ", round(Total_cond0_upper, 3), "]"),
+    `ACME (Blast+)` = paste0("[", round(ACME_cond1_lower, 3), ", ", round(ACME_cond1_upper, 3), "]"),
+    `ADE (Blast+)` = paste0("[", round(ADE_cond1_lower, 3), ", ", round(ADE_cond1_upper, 3), "]"),
+    `Total (Blast+)`= paste0("[", round(Total_cond1_lower, 3), ", ", round(Total_cond1_upper, 3), "]")
+  ) %>%
+  transmute(
+    exposure, mediator, outcome,
+    `ACME (Blast-)`, `ADE (Blast-)`, `Total (Blast-)`,
+    `ACME (Blast+)`, `ADE (Blast+)`, `Total (Blast+)`,
+    Genus, Family, Order, Class, Phylum, Kingdom, full_name
+  )
+
+
+ci_blast
+ci_vns
+```
+
+
+```{r}
+b_tables <- list(
+  "lmer_m" = all_m,
+  "lmer_y" = all_y,
+  "mdact_mediation" = mdact,
+  "acme_estimation" = acme, 
+  "blast_ci" = ci_blast,
+  "vns_ci" = ci_vns
+)
+```
+
+
+# Save as sheets in the an excel workbook
+```{r}
+# save df as 2 separate sheets
+wb <- createWorkbook()
+addWorksheet(wb, "ANOVA")
+writeData(wb, "ANOVA", anova_df)
+addWorksheet(wb, "posthoc")
+writeData(wb, "posthoc", posthoc_df)
+saveWorkbook(wb, file = "final/cytokine_PC_stats.xlsx", overwrite = TRUE)
+```
+
+```{r}
+# wb <- createWorkbook()
+# addWorksheet(wb, "acute_microbe_model")
+# addWorksheet(wb, "acute_outcome_model")
+# addWorksheet(wb, "acute_MDACT_mediation")
+# addWorksheet(wb, "acute_CI_raw")
+# addWorksheet(wb, "acute_CI_formatted")
+# 
+# addWorksheet(wb, "chronic_microbe_model")
+# addWorksheet(wb, "chronic_outcome_model")
+# addWorksheet(wb, "chronic_MDACT_mediation")
+# addWorksheet(wb, "chronic_CI_raw")
+# addWorksheet(wb, "chronic_CI_formatted")
+# 
+# writeData(wb, "acute_microbe_model", a_tables$lm_m)
+# writeData(wb, "acute_outcome_model", a_tables$lm_y)
+# writeData(wb, "acute_MDACT_mediation", a_tables$mdact_mediation)
+# writeData(wb, "acute_CI_raw", a_tables$acme_estimation)
+# writeData(wb, "acute_CI_formatted", a_tables$blast_ci, startRow = 1, colNames = TRUE)
+# writeData(wb, "acute_CI_formatted", a_tables$vns_ci, startRow = nrow(a_tables$blast_ci) + 4, colNames = TRUE)
+# 
+# writeData(wb, "chronic_microbe_model", b_tables$lmer_m)
+# writeData(wb, "chronic_outcome_model", b_tables$lmer_y)
+# writeData(wb, "chronic_MDACT_mediation", b_tables$mdact_mediation)
+# writeData(wb, "chronic_CI_raw", b_tables$acme_estimation)
+# writeData(wb, "chronic_CI_formatted", b_tables$blast_ci, startRow = 1, colNames = TRUE)
+# writeData(wb, "chronic_CI_formatted", b_tables$vns_ci, startRow = nrow(b_tables$blast_ci) + 4, colNames = TRUE)
+# 
+# saveWorkbook(wb, file = "final/lm_lmer_tables.xlsx", overwrite = TRUE)
+```
+
+```{r}
+wb <- createWorkbook()
+
+# Create style
+header_style <- createStyle(textDecoration = c("bold", "underline"))
+
+# Add sheets
+addWorksheet(wb, "acute_microbe_model")
+addWorksheet(wb, "acute_outcome_model")
+addWorksheet(wb, "acute_MDACT_mediation")
+addWorksheet(wb, "acute_CI_raw")
+addWorksheet(wb, "acute_CI_formatted")
+
+addWorksheet(wb, "chronic_microbe_model")
+addWorksheet(wb, "chronic_outcome_model")
+addWorksheet(wb, "chronic_MDACT_mediation")
+addWorksheet(wb, "chronic_CI_raw")
+addWorksheet(wb, "chronic_CI_formatted")
+
+# ---- Acute ----
+writeData(wb, "acute_microbe_model", a_tables$lm_m, headerStyle = header_style)
+setColWidths(wb, "acute_microbe_model", cols = 1:ncol(a_tables$lm_m), widths = "auto")
+
+writeData(wb, "acute_outcome_model", a_tables$lm_y, headerStyle = header_style)
+setColWidths(wb, "acute_outcome_model", cols = 1:ncol(a_tables$lm_y), widths = "auto")
+
+writeData(wb, "acute_MDACT_mediation", a_tables$mdact_mediation, headerStyle = header_style)
+setColWidths(wb, "acute_MDACT_mediation", cols = 1:ncol(a_tables$mdact_mediation), widths = "auto")
+
+writeData(wb, "acute_CI_raw", a_tables$acme_estimation, headerStyle = header_style)
+setColWidths(wb, "acute_CI_raw", cols = 1:ncol(a_tables$acme_estimation), widths = "auto")
+
+# stacked tables
+writeData(wb, "acute_CI_formatted", a_tables$blast_ci,
+          startRow = 1, headerStyle = header_style)
+
+writeData(wb, "acute_CI_formatted", a_tables$vns_ci,
+          startRow = nrow(a_tables$blast_ci) + 4,
+          headerStyle = header_style)
+
+setColWidths(wb, "acute_CI_formatted",
+             cols = 1:max(ncol(a_tables$blast_ci), ncol(a_tables$vns_ci)),
+             widths = "auto")
+
+# ---- Chronic ----
+writeData(wb, "chronic_microbe_model", b_tables$lmer_m, headerStyle = header_style)
+setColWidths(wb, "chronic_microbe_model", cols = 1:ncol(b_tables$lmer_m), widths = "auto")
+
+writeData(wb, "chronic_outcome_model", b_tables$lmer_y, headerStyle = header_style)
+setColWidths(wb, "chronic_outcome_model", cols = 1:ncol(b_tables$lmer_y), widths = "auto")
+
+writeData(wb, "chronic_MDACT_mediation", b_tables$mdact_mediation, headerStyle = header_style)
+setColWidths(wb, "chronic_MDACT_mediation", cols = 1:ncol(b_tables$mdact_mediation), widths = "auto")
+
+writeData(wb, "chronic_CI_raw", b_tables$acme_estimation, headerStyle = header_style)
+setColWidths(wb, "chronic_CI_raw", cols = 1:ncol(b_tables$acme_estimation), widths = "auto")
+
+# stacked tables
+writeData(wb, "chronic_CI_formatted", b_tables$blast_ci,
+          startRow = 1, headerStyle = header_style)
+
+writeData(wb, "chronic_CI_formatted", b_tables$vns_ci,
+          startRow = nrow(b_tables$blast_ci) + 4,
+          headerStyle = header_style)
+
+setColWidths(wb, "chronic_CI_formatted",
+             cols = 1:max(ncol(b_tables$blast_ci), ncol(b_tables$vns_ci)),
+             widths = "auto")
+
+# Save
+saveWorkbook(wb, "../data/final/lm_lmer_tables.xlsx", overwrite = TRUE)
+```
+

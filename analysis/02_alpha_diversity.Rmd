@@ -1,0 +1,800 @@
+---
+title: "alphadiv_final.Rmd"
+author: "Alyssa N. Easton"
+date: '2025-09-29'
+output: 
+---
+
+Originally `shannon_div.Rmd`, but had to re-run MetaPhlAn to get estimated counts,
+as n_reads was associated with Shannon diversity.
+
+Questions:
+1. Across the metadata, what is associated with alpha diversity?
+2. Does treatment affect alpha diversity?
+3. Is treatment's effect on alpha diversity confounded by any variables (batch, weight)?
+
+## Setup
+```{r "setup", include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache=TRUE)
+knitr::opts_knit$set(root.dir = file.path(Sys.getenv("VNS_ROOT"), "data"))  # stored VNS_ROOT in ~/.Renviron 
+options(digits = 10) ## Formats output to 10 digits
+library(tidyverse)
+library(data.table)
+library(magrittr)
+library(patchwork)
+library(stats)
+library(ggsignif)
+library(lme4)
+library(viridis)
+library(pheatmap)
+library(broom)
+library(janitor)
+library(openxlsx)
+library(zCompositions)
+library(compositions)
+library(nortest)
+source("/proj/gibbons/2024_easton_vns/scripts/shannon_div_functions.R")
+
+```
+
+## Import metadata
+```{r}
+# sort by sequencing id
+metadata <- readRDS("1_preprocessed/metadata.rds") %>%
+  relocate(seq_name, .before = 6) %>%
+  arrange(seq_name)
+
+seq_a <- metadata %>% filter(cohort == "A") %>% pull(seq_name)
+seq_b <- metadata %>% filter(cohort == "B") %>% pull(seq_name)
+
+# species-level count table
+
+# take a random sub-sample of X counts (find lowest total counts/sample)
+
+# calculate Shannon diversity, species observed, and another dominance metric
+```
+
+# Process Microbiome data
+## Import + Preprocess Taxonomic Counts
+Preprocess new MetaPhlAn output myself - get *species-level count table*
+```{r}
+files <- list.files("/proj/gibbons/2024_easton_vns/metaphlan_2/metaphlan", 
+                    pattern = "_metaphlan\\.txt$", full.names = TRUE)
+
+dt <- rbindlist(lapply(files, function(f) {
+  fread(f)[, seq_name := sub("_metaphlan\\.txt$", "", basename(f))]
+}), fill = TRUE) %>%
+  rename(
+    clade_name = `#clade_name`,
+    est_n_reads = estimated_number_of_reads_from_the_clade
+    ) %>%
+  filter(seq_name %in% metadata$seq_name)
+
+s_long <- dt %>%                 # we can do this for any taxonomic level
+  filter(
+    grepl("\\|s__", clade_name) | clade_name == "UNCLASSIFIED",
+    !grepl("\\|t__", clade_name)
+  ) %>%
+  mutate(
+    clade_name = ifelse(
+      clade_name == "UNCLASSIFIED",
+      "k__unclassified|p__unclassified|c__unclassified|o__unclassified|f__unclassified|g__unclassified|s__unclassified",
+      clade_name
+      )
+  )
+
+full_taxonomy <- data.frame(full_name = unique(s_long$clade_name)) %>%
+  separate(
+    full_name,
+    sep = "\\|",
+    into = c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"), # no "Strain"
+    fill = "right",
+    remove = FALSE
+  ) %>%
+  mutate(
+    Kingdom = gsub("k__", "", Kingdom),
+    Phylum  = gsub("p__", "", Phylum),
+    Class   = gsub("c__", "", Class),
+    Order   = gsub("o__", "", Order),
+    Family  = gsub("f__", "", Family),
+    Genus   = gsub("g__", "", Genus),
+    Species = gsub("s__", "", Species)
+  )
+
+# check that all species names are still unique
+length(unique(full_taxonomy$Species)) == length(unique(full_taxonomy$full_name))
+
+s_long <- s_long %>%
+  left_join(
+    full_taxonomy %>%
+      dplyr::select(full_name, Species),
+    by = c("clade_name" = "full_name")
+    ) %>%
+  mutate(
+    clade_name = coalesce(Species, clade_name)
+    ) %>%
+  dplyr::select(-Species)
+
+s_counts <- s_long %>%
+  pivot_wider(
+    ., id_cols = "seq_name", names_from = "clade_name", values_from = "est_n_reads"
+    ) %>%
+  dplyr::select(-unclassified)   # remove because some values are negative
+
+s_relabund <- s_long %>%
+  pivot_wider(., id_cols = "seq_name", names_from = "clade_name", values_from = "relative_abundance")
+
+```
+
+Rarefy count table to lowest n_reads (for each cohort)
+  cohort A worst depth is sample *1413* (575,229 reads), followed by *1419*
+  cohort B worst depth is sample *1766* (154,195 reads), followed by *1765* <- keep an eye on this 1766 - might need to drop?
+```{r}
+counts_both <- s_counts %>%
+  filter(seq_name %in% c(seq_a, seq_b)) %>%
+  dplyr::select(where(~ !all(is.na(.)))) %>%
+  mutate(across(everything(), ~replace_na(., 0))) %>%
+  column_to_rownames("seq_name")
+
+counts_a <- s_counts %>%
+  filter(seq_name %in% seq_a) %>%
+  dplyr::select(where(~ !all(is.na(.)))) %>%
+  mutate(across(everything(), ~replace_na(., 0))) %>%
+  column_to_rownames("seq_name")
+
+counts_b <- s_counts %>%
+  filter(seq_name %in% seq_b) %>%
+  dplyr::select(where(~ !all(is.na(.)))) %>%
+  mutate(across(everything(), ~replace_na(., 0))) %>%
+  column_to_rownames("seq_name")
+
+# also just go ahead and separate the relative abundance into a and b
+relabund_a <- s_relabund %>%
+  filter(seq_name %in% seq_a) %>%
+  dplyr::select(where(~ !all(is.na(.))))
+relabund_b <- s_relabund %>%
+  filter(seq_name %in% seq_b) %>%
+  dplyr::select(where(~ !all(is.na(.))))
+```
+
+## Do rarefaction by hand
+(this uses my own function `rarefy`, which is in `shannon_div_functions.R`)
+```{r}
+set.seed(145)
+raref_both <- rarefy(counts_both)  # 256 species
+raref_a <- rarefy(counts_a)        # 214 species
+raref_b <- rarefy(counts_b)        # 231 species
+```
+
+Just curious about presence after rarefying
+```{r}
+presence_a <- return.presence(raref_a, colnames(raref_a))
+presence_b <- return.presence(raref_b, colnames(raref_b))
+presence_both <- return.presence(raref_both, colnames(raref_both))
+
+hist(presence_a)
+hist(presence_b)
+hist(presence_both)
+```
+
+
+## Clean metadata
+```{r}
+
+clean_meta <- function(meta) {
+  meta %>%
+    mutate(
+      Round_main    = droplevels(Round_main),
+      blast         = ifelse(Injury    == "Blast",                   1, 0),
+      vns           = ifelse(Treatment == "VNS",                     1, 0),
+      blast_and_vns = ifelse(Injury == "Blast" & Treatment == "VNS", 1, 0),
+      seq_name      = as.character(seq_name),
+      inj_trt_group = fct_relevel(
+        inj_trt_group, "Sham + Sham", "Blast + Sham", "Sham + VNS", "Blast + VNS"
+        )
+      ) %>%
+    dplyr::select(where(~ !all(is.na(.)))) %>%  # same as meta <- meta[, colSums(is.na(meta)) != nrow(meta)]
+    relocate(c("cohort", "inj_trt_group"), .before = 3) %>%
+    relocate(c("animal_code", "seq_name"), .before = 1) %>%
+    dplyr::select(-c("cohort", "file_name", "feces_tp"))
+}
+
+meta_a <- clean_meta(filter(metadata, cohort == "A"))
+meta_b <- clean_meta(filter(metadata, cohort == "B"))
+
+meta_b_smaller <- meta_b %>%
+  dplyr::select(-c(
+    LORR_1, LORR_2, LORR_3,
+    ppi_mV_max_2, ppi_mV_max_10, ppi_mV_max_20, ppi_mV_max_50, ppi_mV_max_100, ppi_mV_max_200, ppi_mV_max_500, ppi_mV_max_1000,
+    PD_0perc, PD_25perc, PD_50perc, PD_75perc, PD_100perc,
+    PD_0RHElate, PD_25RHElate, PD_50RHElate, PD_75RHElate, PD_100RHElate,
+    PD_0HEITI, PD_25HEITI, PD_50HEITI, PD_75HEITI, PD_100HEITI,
+    EtOH_24h_1, EtOH_24h_2, EtOH_24h_3, EtOH_24h_4, EtOH_24h_5, EtOH_24h_6, EtOH_24h_7, EtOH_24h_8, EtOH_24h_9, EtOH_24h_10,
+    EtOH_24h_11, EtOH_24h_12, EtOH_pref_24h_1, EtOH_pref_24h_2, EtOH_pref_24h_3, EtOH_pref_24h_4, EtOH_pref_24h_5,
+    EtOH_pref_24h_6, EtOH_pref_24h_7, EtOH_pref_24h_8, EtOH_pref_24h_9, EtOH_pref_24h_10, EtOH_pref_24h_11, EtOH_pref_24h_12,
+    EtOH_24h, EtOH_pref_24h, EtOH_8pm
+  ))
+```
+
+# Tried filtering before CLR transform - it didn't change much
+Maybe I should CLR-transform here just for the sake of it... ?
+```{r}
+# thresh    <- 0.25
+# 
+# counts    <- counts_a
+# pres      <- counts > 0
+# pct_pres  <- colSums(pres) / nrow(pres)
+# good_taxa <- names(pct_pres)[pct_pres >= thresh] # 138 "good" taxa
+# filt_counts  <- counts[, good_taxa]
+# cm           <- cmultRepl(filt_counts, label = 0, method = "CZM", z.delete = FALSE)   # or method="GBM"
+# clr_mat      <- t(apply(cm, 1, compositions::clr))
+# 
+# clr.transform <- function(count_mat, thresh = 0.25, method = "CZM") {
+#   pres         <- count_mat > 0
+#   pct_pres     <- colSums(pres) / nrow(pres)
+#   good_taxa    <- names(pct_pres)[pct_pres >= thresh] # 138 "good" taxa
+#   filt_counts  <- count_mat[, good_taxa]
+#   cm           <- cmultRepl(filt_counts, label = 0, method = method, z.delete = FALSE)   # or method="GBM"
+#   clr_mat      <- t(apply(cm, 1, compositions::clr))
+#   return(clr_mat)
+# }
+# 
+# # how many do these samples have ? they have some info but not much for whatever reason ...
+# filt_counts["1366", filt_counts["1366", ] != 0]  # only 19 taxa observed/annotated
+# filt_counts["1419", filt_counts["1419", ] != 0]  # only 26 taxa observed/annotated
+```
+
+## Try doing CLR + multiplicative replacement 
+
+```{r}
+# find_best_threshold <- function(count_mat, thresholds = seq(0.1, 0.5, by = 0.05),
+#                                 methods = c("CZM", "GBM")) {
+#   
+#   results <- lapply(thresholds, function(thresh) {
+#     pres         <- count_mat > 0
+#     pct_pres     <- colSums(pres) / nrow(pres)
+#     good_taxa    <- names(pct_pres)[pct_pres >= thresh]
+#     if (length(good_taxa) < 2) return(NULL)  # skip if too few taxa
+#     
+#     filt_counts  <- count_mat[, good_taxa, drop = FALSE]
+#     
+#     method_results <- lapply(methods, function(m) {
+#       cm <- cmultRepl(filt_counts, label = 0, method = m, z.delete = FALSE)
+#       clr_mat <- t(apply(cm, 1, clr))
+#       
+#       # ---- per-feature AD tests ----
+#       ad_stats <- apply(clr_mat, 2, function(feature_vals) {
+#         # AD test on this taxon's clr distribution across samples
+#         test <- tryCatch(ad.test(feature_vals), error = function(e) NULL)
+#         if (is.null(test)) return(NA)
+#         test$statistic
+#       })
+#       
+#       # average statistic across taxa
+#       mean_ad <- mean(ad_stats, na.rm = TRUE)
+#       
+#       data.frame(
+#         threshold = thresh,
+#         method = m,
+#         n_taxa = ncol(clr_mat),
+#         mean_ad_stat = mean_ad
+#       )
+#     })
+#     
+#     do.call(rbind, method_results)
+#   })
+#   
+#   out <- do.call(rbind, results)
+#   
+#   # best threshold per method = lowest average AD statistic
+#   best <- out %>%
+#     group_by(method) %>%
+#     slice_min(mean_ad_stat, n = 1, with_ties = FALSE) %>%
+#     ungroup()
+#   
+#   list(results = out, best = best)
+# }
+# 
+# # Example usage:
+# res_a <- find_best_threshold(
+#   counts_a,
+#   thresholds = seq(0.1, 0.5, by = 0.05),
+#   methods = c("CZM", "GBM")
+#   )
+# 
+# res_b <- find_best_threshold(
+#   counts_b,
+#   thresholds = seq(0.1, 0.5, by = 0.05),
+#   methods = c("CZM", "GBM")
+# )
+# 
+# res_a$best
+# res_b$best
+```
+
+```{r}
+# clr_a <- clr.transform(counts_a, thresh = 0.25, method = "GBM")
+# clr_b <- clr.transform(counts_b, thresh = 0.20, method = "GBM")
+# 
+# # Look through AD stats just because I'm curious for clr B
+# ad_stats <- apply(clr_b, 2, function(feature_vals) {
+#   # AD test on this taxon's clr distribution across samples
+#   test <- tryCatch(ad.test(feature_vals), error = function(e) NULL)
+#   if (is.null(test)) return(NA)
+#   test$statistic
+# })
+# 
+# # look at one of the worst ones (AD = 4.36)
+# hist(clr_b[, "Adlercreutzia_mucosicola"])
+# hist(clr_b[, "GGB31822_SGB45198"]) # this is the very worst (AD = 5.5)
+```
+meh, not horrible ...
+# Redo clr the way I did it originallly (filtering afterwards)
+```{r}
+clr.transform <- function(relab, thresh = 0.25) {
+  relab    <- relab %>%   # already has zero cols removed
+    column_to_rownames("seq_name") %>%
+    mutate(across(everything(), ~replace_na(., 0)/100))
+  pres      <- relab > 0
+  pct_pres  <- colSums(pres) / nrow(pres)
+  good_taxa <- names(pct_pres)[pct_pres >= thresh]
+  relab     <- relab + 1e-8                        # add a pseudocount
+  clr_mat   <- relab %>%
+    apply(1, function(row) {
+      log(row / exp(mean(log(row))))
+    }) %>%
+    t() %>%
+    as.data.frame() %>%
+    setNames(colnames(relab))
+  clr_filt <- clr_mat[, good_taxa]
+  return(clr_filt)
+}
+
+clr_a <- clr.transform(relabund_a, 0.25)
+clr_b <- clr.transform(relabund_b, 0.25)
+```
+
+
+
+# Export some of this preprocessed data
+```{r}
+species_processed <- list(
+  # main outputs for A
+  a_counts      = counts_a,
+  a_counts_rare = raref_a,
+  a_meta        = meta_a,
+  a_relabund    = relabund_a,
+  a_clr         = clr_a,
+  # main outputs for B
+  b_counts      = counts_b,
+  b_counts_rare = raref_b,
+  b_meta        = meta_b_smaller,
+  b_relabund    = relabund_b,
+  b_clr         = clr_b,
+  # other useful info
+  taxonomy_map  = full_taxonomy,
+  all_counts    = s_counts,
+  all_abund     = s_relabund,
+  all_raref     = raref_both
+)
+
+saveRDS(species_processed, "/proj/gibbons/2024_easton_vns/data/1_preprocessed/species_october.rds")
+```
+
+
+
+# Alpha Diversity
+## Calculate per-sample Alpha Diversity indices:
+    *Shannon Index (richness + evenness), Berger-Parker Dominance, Observed features (richness)*
+```{r}
+alpha_div <- function(raref_counts) {
+  shannon    <- vegan::diversity(raref_counts, index = "shannon", MARGIN = 1) # row-wise
+  n_feats    <- rowSums(raref_counts >= 1)
+  simpson    <- vegan::diversity(raref_counts, index = "simpson", MARGIN = 1)
+  invsimpson <- vegan::diversity(raref_counts, index = "invsimpson")
+  richness   <- rowSums(raref_counts > 0)
+  pielou     <- shannon / log(richness)
+  berg_park  <- apply(raref_counts, 1, function(x) {
+    max(x) / sum(x)
+  })
+  
+  data.frame(
+    shannon       = shannon,
+    simpson       = simpson,
+    invsimpson    = invsimpson,
+    richness      = richness,
+    pielou        = pielou,
+    berger_parker = berg_park
+  )
+}
+
+
+alph_a <- alpha_div(raref_a)
+alph_b <- alpha_div(raref_b)
+
+alph_a
+alph_b
+
+saveRDS(alph_a, file = "/proj/gibbons/2024_easton_vns/data/diversity/A_alpha.rds")
+saveRDS(alph_b, file = "/proj/gibbons/2024_easton_vns/data/diversity/B_alpha.rds")
+```
+
+## Merge diversity into metadata
+```{r}
+alpha_div_cols <- colnames(alph_a)
+
+merge_a <- meta_a %>%
+  left_join(alph_a %>% rownames_to_column("seq_name"), by = "seq_name") %>%
+  relocate(all_of(alpha_div_cols), .before = 9)
+
+merge_b <- meta_b_smaller %>%
+  left_join(alph_b %>% rownames_to_column("seq_name"), by = "seq_name") %>%
+  relocate(all_of(alpha_div_cols), .before = 9)
+```
+
+Testing function w/ signif bars
+```{r}
+injtrt_pal <- c(
+  "Sham + Sham"  = "#1032ff",
+  "Sham + VNS"   = "#1032ff",
+  "Blast + Sham" = "#ff9200",
+  "Blast + VNS"  = "#ff9200"
+  )
+
+# Manually assign x-positions of boxes
+pos_map <- c(                # custom spacing
+  "Sham + Sham"  = 4/30,
+  "Blast + Sham" = 10/30,
+  "Sham + VNS"   = 20/30,
+  "Blast + VNS"  = 26/30
+  )
+box_wid <- 4/30
+```
+
+```{r}
+# box_easy <- function(
+#     data,
+#     dv,
+#     y_lab,
+#     groups      = "inj_trt_group",
+#     palette     = injtrt_pal,
+#     x_positions = c(4,10,20,26),
+#     box_width   = 4,
+#     axis_length = 30,
+#     show_legend = FALSE
+#     ) {
+#   # --- Rescale positions and widths to proportions ---
+#   pos_map <- x_positions / axis_length
+#   names(pos_map) <- levels(factor(data[[groups]]))  # match group order
+#   box_width <- box_width / axis_length              # rescale width
+#   error_width <- box_width/2
+#   
+#   # assign numeric xpos to each row
+#   data$xpos <- pos_map[as.character(data[[groups]])]
+# 
+#   # calculate base ymax and step for significance bar stacking
+#   dv_vals <- data[[dv]]
+#   base    <- max(dv_vals, na.rm = TRUE)
+#   step    <- 0.2 * diff(range(dv_vals, na.rm = TRUE))  # spacing between bars
+#   y_max   <- base + 4 * step
+#   
+#   ggplot(data, aes(x = xpos, y = .data[[dv]], group = .data[[groups]], fill = .data[[groups]])) +
+#     geom_boxplot(
+#       width    = box_width,
+#       color    = "grey",
+#       fill     = "transparent",
+#       outliers = FALSE,
+#       coef     = 0
+#     ) +
+#     stat_summary(
+#       geom = "errorbar",
+#       fun.data = "mean_cl_boot",
+#       width = error_width
+#     ) +
+#     geom_point(
+#       position = position_jitter(width = box_width/4, height = 0), # jitter relative to box width
+#       shape    = 22,
+#       size     = 5,
+#       aes(fill = .data[[groups]]),
+#       color    = "black",
+#       stroke   = 1.2
+#     ) +
+#     scale_x_continuous(               # x-axis scaling/locations
+#       limits = c(0, 1),
+#       breaks = pos_map,
+#       labels = names(pos_map)
+#     ) +
+#     # scale_y_continuous(
+#     #   limits = c(min(dv_vals, na.rm = TRUE), y_max)
+#     # ) +
+#     scale_fill_manual(values = palette) +
+#     coord_fixed(
+#       ratio = 1,
+#       clip = "off"
+#       ) +
+#     labs(x = NULL, y = y_lab, fill = NULL) +
+#     # geom_signif(
+#     #   comparisons = list(
+#     #     c("Sham + Sham" , "Blast + Sham"),
+#     #     c("Sham + VNS"  , "Blast + VNS"),
+#     #     c("Sham + Sham" , "Sham + VNS"),
+#     #     c("Blast + Sham", "Blast + VNS")
+#     #   ),
+#     #   map_signif_level = FALSE, 
+#     #   annotations      = rep(" ", 4),
+#     #   y_position       = base + c(1,1,2,3) * step,
+#     #   tip_length       = 0.03
+#     # ) +
+#     theme_classic() +
+#     theme(
+#       legend.justification = "left",
+#       legend.direction     = "vertical",
+#       legend.background    = element_blank(),
+#       legend.box.margin    = margin(0, 0, 10, 0),
+#       # plot.margin          = margin(10, 10, 10, 10),
+#       aspect.ratio         = 1, # square plotting area
+#       axis.title.y         = element_text(size = 33.75),
+#       axis.text.x          = element_blank(),                # element_text(size = 20),
+#       axis.text.y          = element_text(size = 30),
+#       axis.ticks.x         = element_blank(),
+#       axis.line            = element_line(colour = "black", linewidth = 1)
+#     ) +
+#     theme(legend.position = if(!show_legend) "none" else "right")
+# }
+
+```
+  
+## Visualize treatment effects across 4 treatment groups
+```{r}
+datasets <- list(
+  A = merge_a,
+  B = merge_b
+  )
+metrics  <- list(
+  shannon       = "Shannon Index",
+  simpson       = "Simpson Index", 
+  invsimpson    = "Inverse Simpson",
+  richness      = "Observed Species",
+  pielou        = "Pielou's Evenness",
+  berger_parker = "Berger-Parker Index"
+  )
+
+walk2(
+  rep(names(datasets), each = length(metrics)),
+  rep(names(metrics), times = length(datasets)),
+  ~ {
+    dset <- datasets[[.x]]
+    metric <- .y
+    y_lab <- metrics[[metric]]
+    
+    p <- box_easy(data = dset, dv = metric, y_lab = y_lab) + ggtitle(.x)
+    ggsave(
+      filename = sprintf("../figures/%s_%s_box.svg", .x, metric),
+      plot = p,
+      width = 5,
+      device = "svg"
+    )
+  }
+)
+
+```
+
+
+    Shannon Diversity
+```{r}
+shan_a <- box_easy(
+  data  = merge_a,
+  dv    = "shannon",
+  y_lab = "Shannon Index"
+  ) + ggtitle("A")
+
+shan_b <- box_easy(
+  data  = merge_b,
+  dv    = "shannon",
+  y_lab = "Shannon Index"
+  ) + ggtitle("B")
+
+# ggsave("../figures/AB_shannon_box.png", shan_a + shan_b, width = 11)
+# ggsave("../figures/AB_shannon_box.svg", shan_a + shan_b, width = 11, device = "svg")
+
+ggsave("../figures/A_shannon_box.svg", shan_a, width = 5, device = "svg")
+ggsave("../figures/B_shannon_box.svg", shan_b, width = 5, device = "svg")
+
+```
+Simpson Index
+```{r}
+simp_a <- box_easy(data = merge_a, dv = "simpson", y_lab = "Simpson Index") + ggtitle("A")
+simp_b <- box_easy(data = merge_b, dv = "simpson", y_lab = "Simpson Index") + ggtitle("B")
+
+# ggsave("../figures/AB_simpson_box.png", simp, width = 11)
+# ggsave("../figures/AB_simpson_box.svg", simp, width = 11, device = "svg")
+
+ggsave("../figures/A_simpson_box.svg", simp_a, width = 5, device = "svg")
+ggsave("../figures/B_simpson_box.svg", simp_b, width = 5, device = "svg")
+```
+
+Inverse Simpson
+```{r}
+# isimp_a <- split.boxplot(merge_a, "invsimpson", two_colors, y_lab = "Inverse Simpson") + ggtitle("A")
+# isimp_b <- split.boxplot(merge_b, "invsimpson", two_colors, y_lab = "Inverse Simpson") + ggtitle("B")
+# 
+# isimp_a
+# isimp_b
+# ggsave("../figures/AB_invsimpson_box.png", isimp_a + isimp_b)
+# 
+# isimp_a <- split.barplot(merge_a, "invsimpson", two_colors, y_lab = "Inverse Simpson") + ggtitle("A")
+# isimp_b <- split.barplot(merge_b, "invsimpson", two_colors, y_lab = "Inverse Simpson") + ggtitle("B")
+# ggsave("../figures/AB_invsimpson_bar.png", isimp_a + isimp_b)
+
+isimp <- (box_easy(data = merge_a, dv = "invsimpson", y_lab = "Inverse Simpson") + ggtitle("A")) +
+         (box_easy(data = merge_b, dv = "invsimpson", y_lab = "Inverse Simpson") + ggtitle("B"))
+
+ggsave("../figures/AB_invsimpson_box.png", isimp, width = 11)
+ggsave("../figures/AB_invsimpson_box.svg", isimp, width = 11, device = "svg")
+```
+
+Observed Species
+```{r}
+# rich_a <- split.barplot(merge_a, "richness", two_colors, y_lab = "Observed Species") + ggtitle("A")
+# rich_b <- split.barplot(merge_b, "richness", two_colors, y_lab = "Observed Species") + ggtitle("B")
+# 
+# rich_a
+# rich_b
+# ggsave("../figures/AB_richness_bar.png", rich_a + rich_b)
+
+rich <- (box_easy(data = merge_a, dv = "richness", y_lab = "Observed Species") + ggtitle("A")) +
+        (box_easy(data = merge_b, dv = "richness", y_lab = "Observed Species") + ggtitle("B"))
+
+ggsave("../figures/AB_richness_box.png", rich, width = 11)
+ggsave("../figures/AB_richness_box.svg", rich, width = 11, device = "svg")
+```
+
+Pielou's Evenness
+```{r}
+# even_a <- split.boxplot(merge_a, "pielou", two_colors, y_lab = "Pielou's Evenness") + ggtitle("A")
+# even_b <- split.boxplot(merge_b, "pielou", two_colors, y_lab = "Pielou's Evenness") + ggtitle("B")
+# 
+# even_a
+# even_b
+# ggsave("../figures/AB_pielou_box.png", even_a + even_b)
+
+even <- (box_easy(data = merge_a, dv = "pielou", y_lab = "Pielou's Evenness") + ggtitle("A")) +
+        (box_easy(data = merge_b, dv = "pielou", y_lab = "Pielou's Evenness") + ggtitle("B"))
+
+ggsave("../figures/AB_evenness_box.png", even, width = 11)
+ggsave("../figures/AB_evenness_box.svg", even, width = 11, device = "svg")
+```
+
+Berger-Parker Dominance
+```{r}
+# bpa <- split.barplot(merge_a, "berger_parker", two_colors, y_lab = "Berger-Parker Index") + ggtitle("A")
+# bpb <- split.barplot(merge_b, "berger_parker", two_colors, y_lab = "Berger-Parker Index") + ggtitle("B")
+# 
+# bpa + bpb
+# ggsave("../figures/AB_bergerparker_bar.png", bpa + bpb)
+
+bp <- (box_easy(data = merge_a, dv = "berger_parker", y_lab = "Berger-Parker Index") + ggtitle("A")) +
+      (box_easy(data = merge_b, dv = "berger_parker", y_lab = "Berger-Parker Index") + ggtitle("B"))
+
+ggsave("../figures/AB_bergerparker_box.png", bp, width = 11)
+ggsave("../figures/AB_bergerparker_box.svg", bp, width = 11, device = "svg")
+```
+
+### Test for treatment effects with 2-way ANOVA
+```{r}
+anova_a <- list()
+for (col in alpha_div_cols) {
+  f <- as.formula(paste(col, "~ Injury * Treatment"))
+  anova_a[[col]] <- aov(f, data = merge_a)
+}
+
+anova_b <- list()
+for (col in alpha_div_cols) {
+  f <- as.formula(paste(col, "~ Injury * Treatment"))
+  anova_b[[col]] <- aov(f, data = merge_b)
+}
+
+# get a df for a single ANOVA
+# anova_a_df <- tidy(anova_a[[1]]) %>%
+#   mutate(
+#     across(
+#       c(sumsq, meansq, statistic, p.value),
+#       ~ round(.x, 3))
+#     )
+
+# get df for ALL ANOVAs
+anova_a_df <- map2_dfr(anova_a, names(anova_a), ~ {
+  tidy(.x) %>%
+    mutate(
+      y_variable = .y,
+      across(
+        c(sumsq, meansq, statistic, p.value),
+        ~ round(.x, 3)
+      )
+    )
+}) %>%
+  filter(y_variable %in% c("shannon", "richness", "berger_parker"))
+
+anova_b_df <- map2_dfr(anova_b, names(anova_b), ~ {
+  tidy(.x) %>%
+    mutate(
+      y_variable = .y,
+      across(
+        c(sumsq, meansq, statistic, p.value),
+        ~ round(.x, 3)
+      )
+    )
+}) %>%
+  filter(y_variable %in% c("shannon", "richness", "berger_parker"))   # I actually only want these 3
+
+anova_a_df
+anova_b_df
+```
+
+Same results as last time for *Shannon Index*. 
+  All Alpha diversity measures are significantly ~ Injury in cohort A
+  Only Pielou's Evenness ~ Injury in cohort B
+
+post-hoc pairwise comparisons
+```{r}
+post_hoc <- function(y_var, data) {
+  f <- as.formula(paste(y_var, "~ inj_trt_group"))
+  tests <- list(
+    `Sham-Sham;Blast-Sham` = t.test(
+      f, data = subset(data, inj_trt_group %in% c("Sham + Sham","Blast + Sham"))
+    ),
+    `Sham-VNS;Blast-VNS` = t.test(
+      f, data = subset(data, inj_trt_group %in% c("Sham + VNS","Blast + VNS"))
+    ),
+    `Sham-Sham;Sham-VNS` = t.test(
+      f, data = subset(data, inj_trt_group %in% c("Sham + Sham","Sham + VNS"))
+    ),
+    `Blast-Sham;Blast-VNS` = t.test(
+      f, data = subset(data, inj_trt_group %in% c("Blast + Sham","Blast + VNS"))
+    )
+  )
+  raw_p <- sapply(tests, \(x) x$p.value)
+  p.adjust(raw_p, method = "bonferroni")
+}
+
+shan_tests_a <- post_hoc("shannon", merge_a)
+shan_tests_b <- post_hoc("shannon", merge_b)
+rich_tests_a <- post_hoc("richness", merge_a)
+rich_tests_b <- post_hoc("richness", merge_b)
+berg_tests_a <- post_hoc("berger_parker", merge_a)
+berg_tests_b <- post_hoc("berger_parker", merge_b)
+
+a_post_hocs <- data.frame(
+  shannon = shan_tests_a,
+  n_species = rich_tests_a,
+  berger_parker = berg_tests_a
+)
+
+b_post_hocs <- data.frame(
+  shannon = shan_tests_b,
+  n_species = rich_tests_b,
+  berger_parker = berg_tests_b
+)
+```
+  
+
+
+# Save tables to excel
+*We have stats in tables* `anova_a_df`, `anova_b_df`, ``
+Let's save them to an excel file
+```{r}
+wb <- createWorkbook()
+
+addWorksheet(wb, "A_anova")
+addWorksheet(wb, "A_posthoc")
+addWorksheet(wb, "B_anova")
+addWorksheet(wb, "B_posthoc")
+
+writeData(wb, "A_anova",   anova_a_df)
+writeData(wb, "A_posthoc", a_post_hocs)
+writeData(wb, "B_anova",   anova_b_df)
+writeData(wb, "B_posthoc", b_post_hocs)
+
+saveWorkbook(wb, file = "final/alpha_div_tests.xlsx", overwrite = FALSE)
+```
+

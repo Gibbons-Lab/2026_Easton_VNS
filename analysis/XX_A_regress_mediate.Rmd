@@ -1,0 +1,1310 @@
+---
+title: "XX_A_regress_mediate.Rmd"
+author: "Alyssa N. Easton"
+date: '2026-07-07'
+output:
+---
+
+Testing the hypothesis:
+“Microbe mediates ANY component of the blast → outcome relationship”
+
+## Setup
+```{r "setup", include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache=TRUE)
+knitr::opts_knit$set(root.dir = file.path(Sys.getenv("VNS_ROOT"), "data"))  # stored VNS_ROOT in ~/.Renviron
+options(expressions = 6000)  # Increase allowed recursion depth
+options(digits = 4) ## Formats output to 10 digits
+library(magrittr)
+library(tidyverse)
+library(broom)
+library(broom.helpers)
+library(rlang)
+library(glue)
+library(janitor)
+library(purrr)
+library(ggh4x)
+library(zCompositions)
+library(parallel)
+library(parallelly)
+library(pbapply)
+library(furrr)      # future_pmap comes from here
+library(future)
+library(limma)
+library(ggeffects)
+library(patchwork)
+library(lme4)
+library(lmerTest)
+library(performance)
+library(MuMIn)
+library(car)
+library(scales)
+library(future.apply)
+library(ComplexHeatmap)
+library(circlize)
+library(cowplot)
+library(Cairo)
+source("./functions/mdact.R")
+source("./functions/june_functions.R")
+source("./functions/shannon_div_functions.R")
+source("./functions/artifact_correct_functions.R")
+source("./functions/lmer_functions.R")
+source("./functions/mediation_utils.R")   # this overrides a lot of mdact.R
+```
+
+## Import and preprocess data
+    metadata, microbe presence/absence, sample-wise presence/absence, batch-wise presence/absence
+    compile into a summary `bug_info`
+```{r}
+all_data <- readRDS("/proj/gibbons/2024_easton_vns/data/1_preprocessed/species_october.rds")
+alpha_a <- readRDS("/proj/gibbons/2024_easton_vns/data/diversity/A_alpha.rds")
+bug_info <- readRDS("../workflow/A_bug_info.rds")
+
+presence_df <- all_data$a_counts %>%
+  mutate(across(everything(), ~ . != 0)) %>%
+  rownames_to_column("seq_name")
+
+per_sample_presence <- all_data$a_counts %>%
+  mutate(across(everything(), ~ . != 0)) %>%
+  {rowSums(.) / ncol(.)}
+
+# all_joint_regr <- readRDS("../B_pM_lmer_0106.rds")
+# out_list <- readRDS("../B_outcome_lmer_0106.rds")
+
+outcome_cols <- c(
+  "acute_cyto_PC1",  "acute_cyto_PC2", "acute_cyto_PC3",
+  "acute_cyto_PC4",   "acute_cyto_PC5"
+  )
+```
+
+# 1: Statistical models
+
+### Processing
+```{r}
+args <- list(
+  total_presence      = 0.3,
+  batch_presence      = 0.1,
+  impute_method       = "GBM",
+  filt_before_clr     = TRUE,
+  ctrl_batch          = TRUE
+  )
+
+filt_bugs <- bug_info %>% filter(
+  pres_total     >= args$total_presence,
+  pres_batch1    >= args$batch_presence,
+  pres_batch3    >= args$batch_presence) %>%
+  pull(microbe)
+
+if (args$filt_before_clr) {
+  filt_counts <- all_data$a_counts %>%
+    dplyr::select(any_of(filt_bugs))
+} else {
+  filt_counts <- all_data$a_counts
+}
+
+imputed_counts <- cmultRepl(filt_counts, label = 0, method = args$impute_method, z.delete = FALSE)
+gm <- exp(rowMeans(log(imputed_counts)))
+clr_mat <- log(imputed_counts) - log(gm)
+clr_df <- as_tibble(clr_mat) %>% scale() %>% as.data.frame() # NOW i've scaled it
+colnames(clr_df) <- colnames(filt_counts)
+rownames(clr_df) <- rownames(clr_mat)
+
+
+adiv_features <- alpha_a %>%
+  transmute(shannon, richness, berger_parker) %>%
+  rownames_to_column("seq_name") %>%
+  mutate(
+    shannon = scale(shannon),
+    richness = scale(richness),
+    berger_parker = scale(log(berger_parker))
+    )
+
+hist(alpha_a$berger_parker)
+hist(adiv_features$berger_parker)
+```
+
+Merge all data into one df 
+  Treatments (exposures) are binary
+  Microbes are filtered, CLR-transformed, and then z-scored
+  Outcome variables are z-scored
+  *Alpha diversity is z-scored!*
+  
+```{r}
+df <- readRDS("/proj/gibbons/2024_easton_vns/data/1_preprocessed/meta_outcomePC_all.rds") %>%
+  dplyr::select(all_of(c(
+    "seq_name", "inj_trt_group", "blast", "vns", "blast_and_vns", "Round_main", outcome_cols
+  ))) %>%
+  mutate(seq_name = as.character(seq_name)) %>%
+  right_join((clr_df %>% rownames_to_column("seq_name")), by = "seq_name") %>%
+  left_join(adiv_features, by = "seq_name")
+
+filt_bugs <- c(filt_bugs, "shannon", "richness", "berger_parker")
+
+# saveRDS(df, "../data/processed/A_clr_df_withalpha_0206.rds")
+# df <- readRDS("../data/processed/A_clr_df_withalpha_0206.rds")
+```
+
+
+## Model microbe (M)
+
+Differential abundance testing (contains p_m)
+  > Added in testing for VNS effect given blast == 1
+  
+```{r}
+model_microbe <- map_dfr(filt_bugs, function(bug_name) {
+  
+  form <- as.formula(paste0(bug_name, " ~ blast + vns + blast_and_vns + Round_main"))
+  terms <- c("blast", "vns", "blast_and_vns") #  "vns_on_blast")
+  n_samples <- sum(!is.na(df[[bug_name]]))
+
+  tryCatch({
+
+    m <- lm(form, data = df, na.action = "na.exclude")
+    sm <- summary(m)$coefficients
+    
+    ################## Fixed effects ##################
+    fe <- tibble(
+      term      = rownames(sm),
+      estimate  = sm[, "Estimate"],
+      std.error = sm[, "Std. Error"],
+      statistic = sm[, "t value"]
+    ) %>%
+      filter(term %in% c("blast", "vns", "blast_and_vns"))  # not sure if we want blast_and_vns
+    
+    ################## P-values ##################
+    # Exact F test is available for lm(), so I will use that instead of asymptotic Chisq
+    pvals <- tibble(
+      term = terms,
+      p.value = c(
+        anova(update(m, . ~ . - blast - blast_and_vns),m, test = "F")$`Pr(>F)`[2],  # any blast effect
+        anova(update(m, . ~ . - vns   - blast_and_vns), m, test = "F")$`Pr(>F)`[2], # any vns effect
+        anova(update(m, . ~ .         - blast_and_vns), m, test = "F")$`Pr(>F)`[2] # interaction
+        # car::linearHypothesis(m, "vns + blast_and_vns = 0")$`Pr(>F)`[2]  # ⭐ VNS effect when blast = 1 (linear contrast)
+      )
+    )
+
+    ################## Combine ################## # removed linear hypothesis from output
+    # bind_rows(
+    #   fe %>% dplyr::select(term, estimate, std.error, statistic),
+    #   tibble(
+    #     term = "vns_on_blast",
+    #     estimate = NA_real_,
+    #     std.error = NA_real_,
+    #     statistic = NA_real_
+    #   )) %>%
+    bind_rows(
+      fe %>%
+        dplyr::select(term, estimate, std.error, statistic) %>%
+        left_join(pvals, by = "term") %>%
+        mutate(
+          microbe = bug_name,
+          n = n_samples
+          )
+    )
+
+  }, error = function(e) {
+
+    tibble(
+      term      = terms,
+      estimate  = NA_real_,
+      std.error = NA_real_,
+      statistic = NA_real_,
+      p.value   = NA_real_,
+      microbe   = bug_name,
+      n         = n_samples
+    )
+  })
+}) %>%
+  group_by(term) %>%
+  mutate(adj.p = p.adjust(p.value, method = "BH")) %>%
+  ungroup()
+
+# saveRDS(model_microbe, "../A_microbe_models_0109.rds")
+# saveRDS(model_microbe, "../A_microbe_models_0113.rds")
+saveRDS(model_microbe, "../data/3_newest/A_microbe_models_0212.rds")
+head(model_microbe)
+```
+
+Separately, run to get regular ("Wald-style" t-test) coefficient p-values (for heat maps)
+```{r}
+# testlm <- lm(
+#   Lachnospiraceae_unclassified_SGB41414 ~ blast + vns + blast_and_vns + Round_main,
+#   data = df
+#   )
+# 
+# summary(testlm)$coefficients
+
+coef_microbe <- map_dfr(filt_bugs, function(bug_name) {
+  
+  form <- as.formula(paste0(bug_name, " ~ blast + vns + blast_and_vns + Round_main"))
+  terms <- c("blast", "vns", "blast_and_vns", "Round_main3", "(Intercept)")
+  n_samples <- sum(!is.na(df[[bug_name]]))
+
+  tryCatch({
+
+    m <- lm(form, data = df, na.action = "na.exclude")
+    sm <- summary(m)$coefficients
+    
+    ################## Fixed effects ##################
+    fe <- tibble(
+      term      = rownames(sm),
+      estimate  = sm[, "Estimate"],
+      std.error = sm[, "Std. Error"],
+      statistic = sm[, "t value"],
+      p.value   = sm[, "Pr(>|t|)"]
+    ) %>%
+      filter(term %in% terms)
+  
+    bind_rows(fe %>% mutate(microbe = bug_name, n = n_samples))
+    
+  }, error = function(e) {
+
+    tibble(
+      term      = terms,
+      estimate  = NA_real_,
+      std.error = NA_real_,
+      statistic = NA_real_,
+      p.value   = NA_real_,
+      microbe   = bug_name,
+      n         = n_samples
+    )
+  })
+}) %>%
+  group_by(term) %>%
+  mutate(adj.p = ifelse(
+    term == "(Intercept)", NA_real_,
+    p.adjust(p.value, method = "BH")
+    )) %>%
+  ungroup()
+
+# saveRDS(coef_microbe, "../data/3_newest/A_microbe_coef_pvals_0206.rds")
+
+head(coef_microbe)
+```
+
+## Model outcome (Y)
+
+Test whether microbes explain any variance in outcome not explained by treatment
+```{r}
+model_outcome <- outcome_cols %>% # used two_col to test
+  set_names() %>%
+  map(function(out) {
+    map_dfr(filt_bugs, function(bug_name) {
+      df$microbe <- df[[bug_name]]
+      # df <- df %>% filter(!is.na(out))      # added this to remove NA outcome samples
+      df <- df %>% filter(!is.na(.data[[out]])) # changed to this because out is a column name
+      form <- as.formula(paste0(out, " ~ microbe + blast + vns + blast_and_vns + Round_main"))
+      terms <- c("blast", "vns", "blast_and_vns", "microbe") # ,"vns_on_blast")
+      n_samples <- sum(!is.na(df[[bug_name]])) # count non-missing samples for this bug
+
+      tryCatch({
+        m <- lm(form, data = df, na.action = "na.exclude")
+        sm <- summary(m)$coefficients   ## ---- fixed-effect estimates ----
+        fe <- tibble(
+          term      = rownames(sm),
+          estimate  = sm[, "Estimate"],
+          std.error = sm[, "Std. Error"],
+          statistic = sm[, "t value"]
+        ) %>%
+          filter(term %in% terms)
+        
+        ################## P-values ##################
+        pvals <- tibble(                ## ---- LRT p-values ----
+          term = terms,
+          p.value = c(      # I am using an exact F-test instead of Chi-squared due to small sample size
+            anova(update(m, . ~ . - blast - blast_and_vns), m, test = "F")$`Pr(>F)`[2], # any blast effect
+            anova(update(m, . ~ . - vns - blast_and_vns), m, test = "F")$`Pr(>F)`[2],    # any vns effect
+            anova(update(m, . ~ . - blast_and_vns), m, test = "F")$`Pr(>F)`[2], # interaction / synergy
+            anova(update(m, . ~ . - microbe), m, test = "F")$`Pr(>F)`[2] # , # microbe
+            # car::linearHypothesis(m, "vns + blast_and_vns = 0")$`Pr(>F)`[2]   # vns on blast
+          ))
+        
+        ################## Combine ##################
+        bind_rows(
+          fe %>% dplyr::select(term, estimate, std.error, statistic)
+          # tibble(
+          #   term = "vns_on_blast",
+          #   estimate = NA_real_,
+          #   std.error = NA_real_,
+          #   statistic = NA_real_
+          # )
+        ) %>%
+          left_join(pvals, by = "term") %>%
+          mutate(
+            microbe = bug_name,
+            n = n_samples
+          )
+
+        fe %>%
+          left_join(pvals, by = "term") %>%
+          mutate(
+            microbe = bug_name,
+            n = n_samples
+          )
+      }, error = function(e) {
+        tibble(
+          term      = terms,
+          estimate  = NA_real_,
+          std.error = NA_real_,
+          statistic = NA_real_,
+          p.value   = NA_real_,
+          microbe   = bug_name,
+          n         = n_samples
+        )
+    })
+  }) %>%
+    mutate(outcome = out) %>%
+    group_by(term) %>%
+    mutate(adj.p = p.adjust(p.value, method = "BH")) %>%
+    ungroup()
+})
+
+# saveRDS(model_outcome, "../A_outcome_models_0113.rds")
+saveRDS(model_outcome, "../data/3_newest/A_outcome_models_0212.rds")
+head(model_outcome)
+```
+
+```{r}
+coef_outcome <- outcome_cols %>% # used two_col to test
+  set_names() %>%
+  map(function(out) {
+    
+    map_dfr(filt_bugs, function(bug_name) {
+    
+      df$microbe <- df[[bug_name]]
+      df <- df %>% filter(!is.na(out))      # added this to remove NA outcome samples
+      form <- as.formula(paste0(out, " ~ microbe + blast + vns + blast_and_vns + Round_main"))
+      terms <- c("blast", "vns", "blast_and_vns", "microbe", "Round_main3", "(Intercept)")
+      n_samples <- sum(!is.na(df[[bug_name]])) # count non-missing samples for this bug
+  
+      tryCatch({
+        m <- lm(form, data = df, na.action = "na.exclude")
+        sm <- summary(m)$coefficients
+        
+        ################## Fixed effects ##################
+        fe <- tibble(
+          term      = rownames(sm),
+          estimate  = sm[, "Estimate"],
+          std.error = sm[, "Std. Error"],
+          statistic = sm[, "t value"],
+          p.value   = sm[, "Pr(>|t|)"]
+        ) %>%
+          filter(term %in% terms)
+      
+        bind_rows(fe %>% mutate(microbe = bug_name, n = n_samples))
+        
+      }, error = function(e) {
+    
+        tibble(
+          term      = terms,
+          estimate  = NA_real_,
+          std.error = NA_real_,
+          statistic = NA_real_,
+          p.value   = NA_real_,
+          microbe   = bug_name,
+          n         = n_samples
+        )
+      })
+      
+    }) %>%
+      mutate(outcome = out) %>%
+      group_by(term) %>%
+      mutate(adj.p = ifelse(term == "(Intercept)", NA_real_, p.adjust(p.value, method = "BH"))) %>%
+      ungroup()
+  })
+
+# saveRDS(coef_outcome, "../A_outcome_coef_pvals_0206.rds")
+# head(coef_outcome)
+```
+
+Organize p-values for mediation analysis
+```{r}
+p_m_df <- model_microbe %>%
+  pivot_wider(id_cols = "microbe", names_from = "term",
+    values_from = "p.value", names_prefix = "pm_"
+    )
+
+p_y_df <- model_outcome %>%
+  map_dfr(function(one) {
+    one %>%
+      dplyr::filter(term == "microbe") %>%
+      dplyr::select(microbe, p.value) %>%
+      dplyr::mutate(outcome = unique(one$outcome))
+  }) %>%
+  pivot_wider(
+    id_cols = "microbe",
+    names_from = "outcome",
+    values_from = "p.value"
+  )
+
+all_p_df <- p_m_df %>%
+  left_join(p_y_df, by = "microbe")
+
+# head(all_p_df)
+# saveRDS(all_p_df, "../data/3_newest/A_p_values_0212.rds")
+```
+
+Also merge regular coefficient p-values
+```{r}
+m_coef_df <- coef_microbe %>%
+  mutate(
+    model = "m",
+    term = ifelse(term == "blast_and_vns", "bv", term)
+    ) %>%
+  transmute(microbe, term, "est" = estimate, "p" = p.value) %>%
+  filter(term %in% c("blast", "vns", "bv")) %>%
+  pivot_wider(
+    id_cols = "microbe", names_from = "term",
+    values_from = c("est", "p"),
+    names_glue = "{.value}_{term}"
+    )
+
+y_coef_df <- coef_outcome %>%
+  map_dfr(function(one) {
+    one %>%
+      mutate(
+        outcome = unique(one$outcome),
+        model = "y",
+        term = ifelse(term == "blast_and_vns", "bv", term)
+      )
+  }) %>%
+  transmute(microbe, outcome, term, "est" = estimate, "p" = p.value) %>%
+  filter(term %in% c("blast", "vns", "bv", "microbe")) %>%
+  pivot_wider(
+    id_cols = c("microbe", "outcome"),
+    names_from = "term",
+    values_from = c("est", "p"),
+    names_glue = "{.value}_{term}"
+    )
+
+head(m_coef_df)
+head(y_coef_df)
+
+coef_df <- list(
+  "m" = m_coef_df,
+  "y" = y_coef_df
+)
+
+saveRDS(coef_df, "../data/3_newest/A_microbe_coef_dfs_0218.rds")
+```
+
+## M-DACT
+
+```{r}
+df            <- readRDS("../data/processed/A_clr_df_withalpha_0206.rds")
+model_microbe <- readRDS("../data/3_newest/A_microbe_models_0212.rds")
+model_outcome <- readRDS("../data/3_newest/A_outcome_models_0212.rds")
+all_p_df      <- readRDS("../data/3_newest/A_p_values_0212.rds")
+```
+
+`one_mdact` just uses all_p_df hard-coded
+```{r}
+i <- c("pm_blast", "pm_vns")
+j <- outcome_cols
+
+mdact_runs <- expand.grid(exp_name = i, out_name = j, stringsAsFactors = FALSE)
+
+# run everything at FDR = 0.10
+all_runs <- pmap_dfr(
+  mdact_runs,
+  function(exp_name, out_name) {
+    one_mdact(
+      all_p_df = all_p_df,
+      pm = exp_name,
+      py = out_name,
+      fdr = 0.1,
+      diagnostic_root = TRUE
+    )
+  }
+)
+```
+
+Run at other FDR levels to get a nice range
+```{r}
+fdr_vec <- c(0.100, 0.125, 0.150, 0.175, 0.200, 0.225, 0.250)
+
+hit_grid <- expand.grid(
+  exp_name = i,
+  out_name = j,
+  fdr = fdr_vec,
+  stringsAsFactors = FALSE
+) %>%
+  pmap_dfr(function(exp_name, out_name, fdr) {
+    one_mdact(
+      all_p_df = all_p_df,
+      pm = exp_name,
+      py = out_name,
+      fdr = fdr,
+      diagnostic_root = TRUE
+    )
+  })
+
+# summarize first FDR level at which each mediator is selected
+signif_by_fdr <- hit_grid %>%
+  group_by(exposure, outcome, mediator) %>%
+  summarise(
+    signif_at = if (any(selected, na.rm = TRUE)) {
+      min(fdr_target[selected], na.rm = TRUE)
+    } else {
+      NA_real_
+    },
+    .groups = "drop"
+  )
+
+# create a threshold table with both discrete and diagnostic thresholds
+thr_wide <- hit_grid %>%
+  distinct(
+    exposure, outcome, fdr_target,
+    dact_thr_discrete, dact_thr_root
+  ) %>%
+  mutate(
+    fdr_lab = paste0("fdr", gsub("\\.", "_", sprintf("%.3f", fdr_target)))
+  ) %>%
+  dplyr::select(
+    exposure, outcome, fdr_lab,
+    dact_thr_discrete, dact_thr_root
+  ) %>%
+  pivot_wider(
+    names_from = fdr_lab,
+    values_from = c(dact_thr_discrete, dact_thr_root),
+    names_glue = "{.value}_{fdr_lab}"
+  )
+
+# merge into final object
+all_run_df <- all_runs %>%
+  left_join(
+    signif_by_fdr,
+    by = c("exposure", "outcome", "mediator")
+  ) %>%
+  left_join(
+    thr_wide,
+    by = c("exposure", "outcome")
+  )
+
+saveRDS(all_run_df, "../data/3_newest/A_mediation_0707.rds")
+```
+
+## Sensitivity check: does uniroot() change selected mediaators?
+```{r}
+root_sensitivity <- hit_grid %>%
+  mutate(
+    selected_root = ifelse(
+      is.finite(dact_thr_root),
+      dact_stat <= dact_thr_root,
+      FALSE
+    ),
+    disagrees_with_discrete = selected_root != selected
+  ) %>%
+  group_by(exposure, outcome, fdr_target) %>%
+  summarise(
+    n_selected_discrete = sum(selected, na.rm = TRUE),
+    n_selected_root = sum(selected_root, na.rm = TRUE),
+    n_disagreements = sum(disagrees_with_discrete, na.rm = TRUE),
+    max_abs_thr_diff = max(abs(dact_thr_root - dact_thr_discrete), na.rm = TRUE),
+    .groups = "drop"
+  )
+
+root_sensitivity
+```
+```{r}
+root_discrepant_mediators <- hit_grid %>%
+  mutate(
+    selected_root = ifelse(
+      is.finite(dact_thr_root),
+      dact_stat <= dact_thr_root,
+      FALSE
+    ),
+    disagrees_with_discrete = selected_root != selected
+  ) %>%
+  filter(disagrees_with_discrete) %>%
+  arrange(exposure, outcome, fdr_target, dact_stat) %>%
+  dplyr::select(
+    exposure, outcome, fdr_target, mediator,
+    dact_stat, selected, selected_root,
+    dact_thr_discrete, dact_thr_root
+  )
+
+root_discrepant_mediators
+```
+I AM HERE
+
+```{r}
+df <- df %>% filter(!is.na(.data[[out]]))
+```
+
+
+It's hard to get hits for VNS --> PC1 because although it has the lowest DACT stats,
+it also has really low threshold for FDR significance due to the p-value distribution.
+
+# 2: Analyzing DA and M-DACT results
+
+Since I already ran prior analyses, I can just import these dfs
+```{r}
+df            <- readRDS("../data/processed/A_clr_df_withalpha_0206.rds")
+model_microbe <- readRDS("../data/3_newest/A_microbe_models_0212.rds")
+model_outcome <- readRDS("../data/3_newest/A_outcome_models_0212.rds")
+all_p_df      <- readRDS("../data/3_newest/A_p_values_0212.rds")
+all_run_df    <- readRDS("../data/3_newest/A_mediation_0707.rds")
+```
+
+## Parsing LMER results
+### Exposure -> microbe
+```{r}
+da_bugs <- model_microbe %>%
+  filter(adj.p < 0.2, term %in% c("blast", "vns")) %>%
+  pull(microbe) %>%
+  unique()
+
+lrt_pvals <- model_microbe %>%
+  filter(microbe %in% da_bugs) %>%
+  transmute(microbe, term, "p" = p.value, "q" = adj.p) %>%
+  filter(term %in% c("blast", "vns")) %>%
+  pivot_wider(
+    id_cols = "microbe", names_from = "term",
+    values_from = c("p", "q"),
+    names_glue = "{.value}_{term}"
+    ) %>%
+  mutate(
+    blast_signif = ifelse(q_blast < 0.2, TRUE, FALSE),
+    vns_signif = ifelse(q_vns < 0.2, TRUE, FALSE),
+    microbe = gsub("_", " ", microbe)
+  )
+
+da_blast <- setNames(lrt_pvals$blast_signif, nm = lrt_pvals$microbe)
+da_vns   <- setNames(lrt_pvals$vns_signif, nm = lrt_pvals$microbe)
+
+```
+
+There are actually hits for blast and VNS!
+
+I think the boxplots are most informative, but I could also plot the estimates as a heat map.
+
+```{r, fig.width = 5, fig.height = 4.5}
+
+m_coef_mat <- m_coef_df %>%
+  filter(microbe %in% da_bugs) %>%
+  mutate(microbe = gsub("_", " ", microbe)) %>%
+  column_to_rownames("microbe") %>%
+  dplyr::select(contains("est")) %>%
+  as.matrix()
+
+colnames(m_coef_mat) <- c("Blast", "VNS", "Blast:VNS")
+
+m_p_mat <- m_coef_df %>%
+  filter(microbe %in% da_bugs) %>%
+  mutate(microbe = gsub("_", " ", microbe)) %>%
+  column_to_rownames("microbe") %>%
+  dplyr::select(contains("p")) %>%
+  mutate(
+    p_blast = case_when(p_blast < 0.001 ~ "**", p_blast < 0.05 ~ "*", .default = ""),
+    p_vns   = case_when(p_vns   < 0.001 ~ "**", p_vns   < 0.05 ~ "*", .default = ""),
+    p_bv    = case_when(p_bv    < 0.001 ~ "**", p_bv    < 0.05 ~ "*", .default = "")
+    ) %>%
+  as.matrix()
+
+absmax <- max(abs(m_coef_mat))
+col_fun <- colorRamp2(
+  c(-absmax, 0, absmax),
+  c("blue", "white", "red")
+)
+
+da_blast <- da_blast[rownames(m_coef_mat)]
+da_vns   <- da_vns[rownames(m_coef_mat)]
+
+blast_color <- c("TRUE" = "#0492c2", "FALSE" = "#FFFFFF00")
+vns_color   <- c("TRUE" = "#FFc067", "FALSE" = "#FFFFFF00")
+
+```
+
+```{r}
+lrt_ann_blast<- rowAnnotation(
+  "LRT Blast FDR < 0.2" = da_blast,
+  col = list("LRT Blast FDR < 0.2" = blast_color),
+  show_annotation_name = FALSE,
+  simple_anno_size = unit(0.2, "cm")
+)
+
+lrt_ann_vns<- rowAnnotation(
+  "LRT VNS FDR < 0.2" = da_vns,
+  col = list("LRT VNS FDR < 0.2" = vns_color),
+  show_annotation_name = FALSE,
+  simple_anno_size = unit(0.2, "cm")
+)
+
+plot(lrt_ann_vns +lrt_ann_blast)
+```
+
+
+```{r, fig.width=6, fig.height=12}
+
+ht <- Heatmap(m_coef_mat, name = "Estimate", col = col_fun,
+  
+  cluster_columns = FALSE,
+  show_row_dend = FALSE,
+  show_column_dend = FALSE,
+  left_annotation = c(lrt_ann_vns, lrt_ann_blast),
+  
+  row_split = da_vns,
+  cluster_rows = TRUE,
+  cluster_row_slices = TRUE,
+  
+  cell_fun = function(j, i, x, y, w, h, fill) {
+    grid::grid.text(
+      m_p_mat[i, j],
+      x = x,
+      y = y,
+      gp = grid::gpar(
+        fontsize = 14,
+        col = "black",
+        fontface = "bold"
+      )
+    )
+  })
+
+ht
+```
+We see a lot more "effect saturation" here than in the chronic cohort.
+
+```{r}
+pdf("../figures/A_microbe_abundance_fdr20.pdf", width = 6, height = 12)
+ht_drawn <- draw(ht)
+# row_ord <- row_order(ht_drawn)
+# da_bug_order <- rownames(trt_effect_matrix)[row_ord]
+dev.off()
+```
+
+```{r}
+pdf("../figures/A_microbe_abundance_fdr20_short.pdf", width = 6, height = 6)
+ht_drawn <- draw(ht)
+# row_ord <- row_order(ht_drawn)
+# da_bug_order <- rownames(trt_effect_matrix)[row_ord]
+dev.off()
+```
+
+Can also plot/test "presence/absence" if reviewers request, but the results did align well when I tested them for sparse features (as in, sparse bugs that were significant in the CLR regressions were actually even more significant if I did a presence/absence logistic regression, because CLR-transforming zeroes is just adding noise).
+
+### Microbe  -> outcome (independent of exposure)
+```{r}
+outcome_hits <- map_dfr(model_outcome, function(df) {
+  df %>% filter(term == "microbe", adj.p < 0.15)
+})
+
+outcome_hits
+```
+
+*GGB28456_SGB41039* is associated withacute_cyto_PC2 independent of exposures
+
+These bugs may or may not be affected by treatment, but they explain additional variance in *outcomes*
+```{r}
+form <- as.formula("acute_cyto_PC2 ~ GGB28456_SGB41039 + blast + vns + blast_and_vns + Round_main")
+m    <- lm(form, data = df, na.action = "na.exclude")
+summary(m)
+```
+OK so GGB28456_SGB41039 is associated with higher cytokine PC2 (+1.48),
+which is the opposite direction as blast.
+
+### Plot bug vs. residual outcome
+```{r}
+residout_bug <- function(bug_name, data, outcome_name) {
+  plt <- data.frame(
+    row.names     = data$seq_name,
+    bug_clr       = data[[bug_name]],
+    inj_trt_group = factor(data$inj_trt_group, levels = c("Sham + Sham", "Blast + Sham", "Sham + VNS", "Blast + VNS")),
+    blast         = data$blast,
+    vns           = data$vns,
+    blast_and_vns = data$blast_and_vns,
+    Round_main    = data$Round_main,
+    outcome       = data[[outcome_name]]
+  ) %>%
+    filter(!is.na(outcome))
+  
+  residy <- lm(outcome ~ blast + vns + blast_and_vns + Round_main, data = plt)
+  plt$out_resid <- resid(residy)
+  
+  ggplot(plt, aes(x = bug_clr, y = out_resid)) +     # fill = inj_trt_group, shape = Round_main
+    geom_point(aes(color = inj_trt_group), size = 4, alpha = 0.7) +
+    # scale_fill_manual(values = injtrt_colors) +
+    # scale_shape_manual(values = batch_shapes) +
+    # geom_smooth(aes(color = inj_trt_group), method = "lm", se = FALSE, alpha = 0.2) +
+    scale_color_manual(values = injtrt_colors) +
+    geom_smooth(method = "lm", se = FALSE, color = "black",linetype = "dashed") +
+    labs(
+      x = paste0(gsub("_", " ", bug_name), " Abundance (4h)"),
+      y = paste0("Residual", gsub("acute_cyto_", "", outcome_name), " (4h)")
+    ) +
+    theme_bw() + 
+    theme(
+      legend.position = "none",
+      axis.text = element_text(size = 20),
+      axis.title = element_text(size = 20)
+      )
+}
+```
+Could use bootstrapping to estimate these effects (slopes) as well. 
+
+Save all these to a single pdf
+```{r}
+residout_plots <- list()
+pdf("../figures/A_not_mediators.pdf", width = 5, height = 5)
+
+for (i in 1:nrow(outcome_hits)) {
+  residout_plots[[i]] <- residout_bug(outcome_hits[[i, "microbe"]], df, outcome_hits[[i, "outcome"]])
+  print(residout_plots[[i]])
+}
+
+# Close the PDF device to save
+dev.off()
+
+print(residout_plots[[1]])
+```
+
+function to plot multiple to 1 page
+```{r}
+pdf_split <- function(hit_df, data_df, sub_height, sub_width, n_cols, plot_function, filename) {
+  n_plts <- nrow(hit_df)
+  n_rows <- ceiling(n_plts / n_cols)
+  
+  pdf_width <- sub_width * n_cols
+  pdf_height <- sub_height * n_rows
+  
+  plot_vector <- vector("list", n_plts)
+  
+  for (i in seq_len(nrow(hit_df))) {
+    plot_vector[[i]] <- residout_bug(hit_df[[i, "microbe"]], data_df, hit_df[[i, "outcome"]])
+  }
+  
+  pdf(filename, width = pdf_width, height = pdf_height)
+  
+  grid.arrange(
+    grobs = plot_vector,
+    ncol = n_cols   # adjust layout
+  )
+  
+  dev.off()
+}
+```
+
+
+### Exposure -> microbe -> outcome 
+```{r}
+med_hits <- all_run_df %>% filter(!is.na(signif_at))
+med_hits
+```
+
+#### Group-wise box-plot (microbes)
+```{r, fig.width = 5, fig.height = 5}
+bugs_to_plot <- unique(c(da_bugs, outcome_hits$microbe, med_hits$mediator))
+bug_names <- bugs_to_plot %>%
+  str_replace_all("sp", "sp.") %>%
+  str_replace_all("_", " ")
+
+bug_boxplots <- list()
+
+df$inj_trt_group <- factor(
+  df$inj_trt_group,
+  levels = c("Sham + Sham", "Blast + Sham", "Sham + VNS", "Blast + VNS")
+  )
+```
+
+Save all these to a single pdf
+```{r}
+# Open the PDF device
+pdf("../figures/A_microbe_abundance.pdf", width = 5, height = 5) # You can adjust dimensions
+# each loop adds a new pdf page
+for (i in 1:length(bugs_to_plot)) {
+  bug_boxplots[[i]] <- box_easier(df, bugs_to_plot[i], bug_names[i])
+  print(bug_boxplots[[i]])
+}
+
+# Close the PDF device to save
+dev.off()
+```
+
+
+
+## ACME Bootstrap CI
+
+Estimate mediation effect magnitude with bootstrapping
+```{r}
+med_hits <- all_run_df %>% filter(!is.na(signif_at))
+
+med_ci_input <- med_hits %>%
+  transmute(exposure, mediator, outcome) %>% # no p_method
+  mutate(
+    exposure = gsub("pm_", "", exposure),  # this assumes no exposures are "vns_on_blast"
+    condition = case_when(
+      exposure == "blast" ~ "vns",
+      exposure == "vns" ~ "blast"
+    )
+  ) %>%
+  split(seq_len(nrow(.))) %>% 
+  map(as.list)
+
+med_ci_input[[1]]
+```
+
+Had to change some things from `boot_med_lmer` which does a cluster bootstrap. I instead just did a regular (row) resampling bootstrap
+```{r}
+plan(multisession, workers = 6) # because med_ci_input is a list of 12
+
+ci_list <- future_lapply(med_ci_input, function(x) {
+  strat_boot_lm(
+    data     = df,
+    exposure = x$exposure,
+    mediator = x$mediator,
+    outcome  = x$outcome,
+    n_boot   = 999
+    ) }, future.seed = 125)
+
+ci_df <- bind_rows(ci_list)
+
+saveRDS(ci_df, "/proj/gibbons/2024_easton_vns/data/3_newest/A_bootCI_df_0212.rds")
+ci_df
+```
+
+## Plot coefficients for mediators + annotate with p-values
+  Get the order of microbes
+### new code
+```{r}
+# med_bugs <- unique(med_hits$mediator) # luckily they are all unique
+
+med_bugs <- med_hits %>%
+  filter(signif_at <= 0.2) %>%
+  pull(mediator)
+
+m_coef_mat <- m_coef_df %>%
+  filter(microbe %in% med_bugs) %>%
+  column_to_rownames("microbe") %>%
+  dplyr::select(contains("est")) %>%
+  as.matrix()
+
+m_p_mat <- m_coef_df %>%
+  filter(microbe %in% med_bugs) %>%
+  column_to_rownames("microbe") %>%
+  dplyr::select(contains("p")) %>%
+  mutate(
+    p_blast = case_when(p_blast < 0.001 ~ "**", p_blast < 0.05 ~ "*", .default = ""),
+    p_vns   = case_when(p_vns   < 0.001 ~ "**", p_vns   < 0.05 ~ "*", .default = ""),
+    p_bv    = case_when(p_bv    < 0.001 ~ "**", p_bv    < 0.05 ~ "*", .default = "")
+    ) %>%
+  as.matrix()
+
+y_coef_mat <- y_coef_df %>%
+  semi_join(med_hits, by = c("outcome", "microbe" = "mediator")) %>%
+  column_to_rownames("microbe") %>%
+  dplyr::select(contains("est")) %>%
+  as.matrix()
+
+y_p_mat <- y_coef_df %>%
+  semi_join(med_hits, by = c("outcome", "microbe" = "mediator")) %>%
+  column_to_rownames("microbe") %>%
+  dplyr::select(contains("p")) %>%
+  mutate(
+    p_blast = case_when(p_blast < 0.001 ~ "**", p_blast < 0.05 ~ "*", .default = ""),
+    p_vns   = case_when(p_vns   < 0.001 ~ "**", p_vns   < 0.05 ~ "*", .default = ""),
+    p_bv    = case_when(p_bv    < 0.001 ~ "**", p_bv    < 0.05 ~ "*", .default = ""),
+    p_microbe = case_when(p_microbe < 0.001 ~ "**", p_microbe    < 0.05 ~ "*", .default = "")
+    ) %>%
+  as.matrix()
+
+row_order <- rownames(m_coef_mat)
+y_coef_mat <- y_coef_mat[row_order, c(colnames(m_coef_mat), "est_microbe")]
+y_p_mat <- y_p_mat[row_order, c(colnames(m_p_mat), "p_microbe")]
+
+row_outcome <- med_hits %>%
+  distinct(mediator, outcome) %>%
+  filter(mediator %in% rownames(m_coef_mat)) %>%
+  tibble::deframe()
+
+row_fdr <- med_hits$signif_at
+names(row_fdr) <- med_hits$mediator
+
+row_outcome <- row_outcome[rownames(m_coef_mat)]
+row_fdr <- row_fdr[rownames(m_coef_mat)]
+
+
+stopifnot(all(names(row_outcome) == rownames(m_coef_mat)))
+stopifnot(all(names(row_outcome) == rownames(y_coef_mat)))
+stopifnot(all(names(row_fdr) == rownames(row_outcome)))
+
+# fdr_fun <- colorRamp2(c(0.00, 0.30), c("darkgreen", "lightyellow"))
+fdr_value_vector <- rev(c(0.1, 0.125, 0.15, 0.175, 0.20))
+
+fdr_colors <- structure(
+  RColorBrewer::brewer.pal(length(fdr_value_vector), "Greens"),
+  names = fdr_value_vector
+  )
+
+absmax <- max(abs(c(m_coef_mat, y_coef_mat)))
+col_fun <- colorRamp2(
+  c(-absmax, 0, absmax),
+  c("blue", "white", "red")
+)
+
+```
+
+Annotation first
+```{r}
+fdr_annotation <- rowAnnotation(
+  "FDR <" = row_fdr,
+  col = list("FDR <" = fdr_colors),
+  show_annotation_name = FALSE,
+  simple_anno_size = unit(0.2, "cm")
+)
+
+plot(fdr_annotation)
+```
+
+```{r}
+# heatmap model M coefficients
+ht_m <- Heatmap(
+  m_coef_mat,
+  name = "M Estimate",
+  col = col_fun,
+  left_annotation = fdr_annotation,
+  
+  row_split = row_outcome,
+  cluster_rows = TRUE,
+  cluster_row_slices = TRUE,
+  cluster_columns = FALSE,
+  show_row_dend = FALSE,
+  show_column_dend = FALSE,
+  cell_fun = function(j, i, x, y, w, h, fill) {
+    grid::grid.text(
+      m_p_mat[i, j],
+      x = x,
+      y = y,
+      gp = grid::gpar(
+        fontsize = 14,
+        col = "black",
+        fontface = "bold"
+      )
+    )
+  })
+
+# ht_m
+```
+
+```{r}
+# heatmap model Y coefficients
+ht_y <- Heatmap(
+  y_coef_mat,
+  name = "Y Estimate",
+  col = col_fun,
+  
+  row_split = row_outcome,
+  cluster_rows = TRUE,
+  cluster_row_slices = TRUE,
+  
+  cluster_columns = FALSE,
+  show_row_dend = FALSE,
+  show_column_dend = FALSE,
+  cell_fun = function(j, i, x, y, w, h, fill) {
+    grid::grid.text(
+      y_p_mat[i, j],
+      x = x,
+      y = y,
+      gp = grid::gpar(
+        fontsize = 14,
+        col = "black",
+        fontface = "bold"
+      )
+    )
+  })
+
+# ht_y
+```
+
+
+```{r, fig.width = 8, fig.height = 7}
+ht_list <- ht_m + ht_y
+
+draw(ht_list, main_heatmap = "M Estimate")
+draw(ht_list, main_heatmap = "Y Estimate")
+```
+
+Now save
+```{r}
+pdf("../figures/A_med_coef_heatmap.pdf", width = 8, height = 7)
+ht_drawn <- draw(ht_list, main_heatmap = "M Estimate")
+rows <- row_order(ht_drawn)
+dev.off()
+```
+
+## Plotting blast mediation hits
+*Doing this after heat maps so I can use same order as clustering*
+```{r}
+ht_row_order <- c(unlist(rows[1]), unlist(rows[2]))
+names(ht_row_order) <- NULL
+ht_row_order
+
+ci_row_order <- row_order[ht_row_order]
+ci_row_order
+```
+
+
+```{r}
+ci_plt <- ci_df %>%
+  filter(mediator %in% ci_row_order) %>%
+  mutate(
+    exposure = factor(exposure, levels = c("blast", "vns")),
+    mediator = factor(mediator, levels = ci_row_order),     # don't reverse
+    outcome  = factor(outcome, levels = c("acute_cyto_PC3", "acute_cyto_PC5")),
+    exp_med_out  = as.character(interaction(exposure, mediator, outcome, sep = ";"))
+    ) %>%
+  pivot_longer(
+    cols = matches("^(ACME|ADE|Total)_"),
+    names_to = c("effect", "cond", ".value"),
+    names_pattern = "^([^_]+)_([^_]+)_(.+)$"
+  ) %>%
+  mutate(
+    effect = factor(effect, levels = c("ACME", "ADE", "Total")),
+    cond   = factor(cond, levels = c("cond0", "cond1")),
+    # exp_med_out = factor(paste0(exposure, ";", outcome, ";", mediator)),
+    exp_med_out_cond = factor(paste0(exp_med_out, ";", cond))
+    # microbe = factor(mediator)
+  ) %>%
+  arrange(mediator)
+
+shade_bands <- ci_plt %>%
+  group_by(mediator) %>% 
+  arrange(by = mediator) %>%
+  mutate(
+    band_id = as.numeric(mediator),
+    fill = ifelse(band_id %% 2 == 1, "grey95", "transparent")
+    )
+
+effect_colors <- c(
+  "ADE"   = "#9C2121",
+  "ACME"  = "#689835",
+  "Total" = "#070E00"
+)
+```
+
+```{r, fig.width = 7, fig.height = 7}
+
+plt <- ggplot(ci_plt, aes(x = est, y = effect, color = effect)) +
+  geom_rect(data = shade_bands, aes(
+      xmin = -Inf, xmax = Inf,
+      ymin = -Inf, ymax = Inf,
+      fill = fill
+      ), inherit.aes = FALSE, color = NA) +
+  geom_point(size = 1.5) +
+  geom_linerange(aes(xmin = lower, xmax = upper), linewidth = 0.4) +
+  scale_fill_identity() +
+  # geom_errorbarh(aes(xmin = mean - se, xmax = mean + se), linewidth = 0.3, height = 0.5) +
+  scale_color_manual(values = effect_colors) +
+  facet_grid(
+    rows = vars(mediator), # if multiple exposure/outcomes, use exp_med_out
+    cols   = vars(cond),
+    space  = "free_y",
+    # switch = "y", scales = "free_y",
+    ) +
+  # scale_x_continuous(limits = c(xmin, xmax)) +
+  labs(x = NULL, y = NULL) +
+  guides(fill = guide_legend(reverse = TRUE)) +
+  theme_minimal(base_size = 14) +
+  theme(
+    strip.placement   = "outside",
+    panel.spacing.y   = unit(0.1, "lines"),   # try 1-3 "lines" of spacing
+    panel.spacing.x   = unit(0.1, "lines"),   # put close together
+    axis.text.y       = element_blank(),
+    axis.ticks.y      = element_blank(),
+    axis.ticks.x      = element_line(color = "black", linewidth = 0.3),
+    axis.line.x       = element_line(colour = "black", linewidth = 0.4),
+    panel.grid        = element_blank(),
+    panel.background  = element_blank()
+  )
+
+plt1 <- plt + theme(
+  legend.position    = "none",
+  strip.text.y.right = element_text(
+    angle = 0, margin = margin(l = 4, unit = "pt"), hjust = 0
+  ))
+
+plt2 <- plt + theme(legend.position = "none", strip.text.y.right = element_blank())
+
+plt_leg <- plt + theme(strip.text.y.right = element_blank())
+legend_only <- get_legend(plt_leg)
+
+plt1
+```
+
+do as device instead (so I can save plot with legend)
+```{r}
+row_height  <- 0.5
+panel_width <- 2
+
+pdf("../figures/A_med_blast_cond_blocked.pdf",
+    width = (panel_width*2) + 3,
+    height = (nlevels(shade_bands$mediator) * row_height))
+
+print(plt1)
+plot(legend_only)
+dev.off()
+```
+
+
+
+
+#### Also plot residual outcome vs. residual bug for the mediators
+I want to plot residual outcome vs. bug
+```{r}
+residout_residbug <- function(bug_name, data, outcome_name) {
+  plt <- data.frame(
+    row.names     = data$seq_name,
+    bug_clr       = data[[bug_name]],
+    inj_trt_group = data$inj_trt_group,
+    blast         = data$blast,
+    vns           = data$vns,
+    blast_and_vns = data$blast_and_vns,
+    Round_main    = data$Round_main,
+    outcome       = data[[outcome_name]]
+  ) %>%
+    filter(!is.na(outcome))
+  
+  residy <- lm(outcome ~ blast + vns + blast_and_vns + Round_main, data = plt)
+  residx <- lm(bug_clr ~ blast + vns + blast_and_vns + Round_main, data = plt)
+  plt$out_resid <- resid(residy)
+  plt$bug_resid <- resid(residx)
+  
+  ggplot(plt, aes(x = bug_resid, y = out_resid)) +     # fill = inj_trt_group, shape = Round_main
+    geom_point(aes(color = inj_trt_group), size = 4, alpha = 0.7) +
+    # scale_fill_manual(values = injtrt_colors) +
+    # scale_shape_manual(values = batch_shapes) +
+    # geom_smooth(aes(color = inj_trt_group), method = "lm", se = FALSE, alpha = 0.2) +
+    scale_color_manual(values = injtrt_colors) +
+    geom_smooth(method = "lm", se = FALSE, color = "black",linetype = "dashed") +
+    labs(
+      x = paste("Residual \n", gsub("_", " ", bug_name)),  # use expression(italic()) to italicize
+      y = paste0("Residual ", gsub("acute_cyto_", "", outcome_name))
+    ) +
+    theme_bw() +
+    theme(
+      legend.position = "none",
+      axis.text = element_text(size = 14),
+      axis.title = element_text(size = 20)
+      )
+}
+```
+
+```{r, fig.width = 5, fig.height = 5}
+testplot <- residout_residbug(med_hits[[1, "mediator"]], df, med_hits[[1, "outcome"]])
+print(testplot)
+```
+
+
+Save all these to a single pdf
+```{r, fig.width = 4, fig.height = 4}
+resid_resid_plots <- list()
+pdf("../figures/A_outcome_resid_resid_plots.pdf", width = 5, height = 5)
+
+for (i in 1:nrow(med_hits)) {
+  resid_resid_plots[[i]] <- residout_residbug(med_hits[[i, "mediator"]], df, med_hits[[i, "outcome"]])
+  print(resid_resid_plots[[i]])
+}
+
+# Close the PDF device to save
+dev.off()
+```
+
+

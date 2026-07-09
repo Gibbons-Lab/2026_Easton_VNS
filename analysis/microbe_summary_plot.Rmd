@@ -1,0 +1,844 @@
+---
+title: "microbe_summary_plot.Rmd"
+author: "Alyssa N. Easton"
+date:   '2025-10-15'
+output: 
+---
+
+# Setup
+```{r "setup", include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache=TRUE)
+knitr::opts_knit$set(root.dir = file.path(Sys.getenv("VNS_ROOT"), "data"))  # stored VNS_ROOT in ~/.Renviron
+options(expressions = 6000)  # Increase allowed recursion depth
+options(digits = 10) ## Formats output to 10 digits
+library(magrittr)
+library(tidyverse)
+library(moments)
+library(broom)
+library(broom.helpers)
+library(HDMT)
+library(rlang)
+library(glue)
+library(janitor)
+library(openxlsx)
+library(purrr)
+library(cowplot)
+library(ggh4x)
+library(svglite)
+library(ggforestplot)
+library(ComplexHeatmap)
+source("../scripts/mdact.R")
+source("../scripts/june_functions.R")
+source("/proj/gibbons/2024_easton_vns/scripts/shannon_div_functions.R")
+```
+
+Data imports
+```{r}
+data <- readRDS("/proj/gibbons/2024_easton_vns/data/1_preprocessed/species_october.rds")
+# lmer <- readRDS("/proj/gibbons/2024_easton_vns/data/lmer/all_diffabund_new.rds")
+lmer_a <- readRDS("/proj/gibbons/2024_easton_vns/data/lmer/A_microbe_2var.rds")
+lmer_b <- readRDS("/proj/gibbons/2024_easton_vns/data/lmer/B_microbe_2var.rds")
+pca <- readRDS("PCA/pca_A_cytokines.rds")
+```
+
+```{r}
+
+```
+
+
+# Make function
+```{r}
+summary_plot <- function(bugs, clr_data, meta) {
+  bug_data <- clr_data %>%
+    dplyr::select(all_of(bugs)) %>%
+    scale() %>% as.data.frame() %>%       # scale
+    rownames_to_column("seq_name") %>%
+    left_join(
+      meta %>%
+        dplyr::select(c("seq_name", "inj_trt_group")),
+      by = "seq_name"
+      ) %>%
+    column_to_rownames("seq_name")
+    
+  plot_bug <- bug_data %>%
+    pivot_longer(
+      cols = -inj_trt_group,
+      names_to = "microbe",
+      values_to = "relab"
+    )
+
+  summary_bug <- plot_bug %>%
+    group_by(microbe, inj_trt_group) %>%
+    summarise(
+      mean = mean(relab, na.rm = TRUE),
+      se   = sd(relab, na.rm = TRUE) / sqrt(n()),
+      .groups = "drop"
+    )
+  
+  summary_bug <- summary_bug %>%
+    # define custom factor order for bugs
+    mutate(
+      # make an ordered factor so all groups of a microbe stay together
+      y_label = factor(
+        paste(microbe, inj_trt_group, sep = "_"),
+        levels = summary_bug %>%
+          arrange(microbe, desc(inj_trt_group)) %>%                       # descending groups
+          transmute(lvl = paste(microbe, inj_trt_group, sep = "_")) %>%
+          pull(lvl)
+      ),
+      inj_trt_group = fct_rev(inj_trt_group),                        # reverse order groups (top-bottom)
+      microbe       = factor(microbe, levels = bugs)                 # don't need to reverse order of microbes?
+    )
+  
+  # compute midpoints for each variable's block
+  microbe_labels <- summary_bug %>%
+    group_by(microbe) %>%
+    summarise(y_mid = mean(as.numeric(y_label)))
+  
+  # Define alternating shading bands
+  shade_bands <- summary_bug %>%
+    group_by(microbe) %>% 
+    arrange(by = microbe) %>%
+    mutate(
+      band_id = as.numeric(microbe),
+      fill = ifelse(band_id %% 2 == 1, "grey95", "white")
+      )
+  
+  # calulate limits 
+  # xlim <- max(abs(c(summary_bug$mean + summary_bug$se, summary_bug$mean - summary_bug$se))) * 1.01
+  xmax <- max(summary_bug$mean + summary_bug$se) * 1.01
+  xmin <- min(summary_bug$mean - summary_bug$se) * 1.01 # assuming negative
+  # plot
+  plt <- ggplot(summary_bug, aes(x = mean, y = inj_trt_group, color = inj_trt_group)) +
+    geom_rect(
+      data = shade_bands,
+      aes(
+        xmin = -Inf, xmax = Inf,
+        ymin = -Inf, ymax = Inf,
+        fill = fill
+      ),
+      inherit.aes = FALSE,
+      color = NA
+    ) +
+    geom_vline(xintercept =  0.0, color = "grey25", alpha = 0.7, linetype = "dashed", linewidth = 0.2) +
+    geom_vline(xintercept =  1.0, color = "grey50", alpha = 0.7, linetype = "dashed", linewidth = 0.2) +
+    geom_vline(xintercept = -1.0, color = "grey50", alpha = 0.7, linetype = "dashed", linewidth = 0.2) +
+    geom_vline(xintercept =  0.5, color = "grey75", alpha = 0.5, linetype = "dashed", linewidth = 0.2) +
+    geom_vline(xintercept = -0.5, color = "grey75", alpha = 0.5, linetype = "dashed", linewidth = 0.2) +
+    # geom_vline(xintercept =  1.5, color = "grey75", alpha = 0.5, linetype = "dashed", linewidth = 0.2) +
+    # geom_vline(xintercept = -1.5, color = "grey75", alpha = 0.5, linetype = "dashed", linewidth = 0.2) +
+    geom_point(size = 1.0) +
+    geom_linerange(aes(xmin = mean - se, xmax = mean + se), linewidth = 0.25) +
+    scale_fill_identity() +
+    # geom_errorbarh(aes(xmin = mean - se, xmax = mean + se), linewidth = 0.3, height = 0.5) +
+    scale_color_manual(values = four_colors) +
+    facet_grid(
+      rows   = vars(microbe),
+      # cols   = vars(location),
+      # scales = "free_y",
+      space  = "free_y",
+      switch = "y"            # plot y-labels on left-hand side (instead of right)
+      ) +
+    scale_x_continuous(limits = c(xmin, xmax)) +
+    labs(x = NULL, y = NULL) +
+    theme_minimal(base_size = 14) +
+    theme(
+      strip.placement   = "outside",
+      strip.text.y.left = element_text(angle = 0, hjust = 1),
+      panel.spacing.y   = unit(0.1, "lines"),   # try 1-3 "lines" of spacing
+      panel.spacing.x   = unit(0.1, "lines"),   # put close together
+      axis.text.y       = element_blank(),
+      axis.ticks.y      = element_blank(),
+      axis.line.x       = element_line(colour = "black", linewidth = 0.4),
+      panel.grid        = element_blank(),
+      panel.background  = element_blank(),
+      legend.position   = "none"
+    )
+  
+  return(plt)
+}
+
+# # removed from function, can be added afterwards
+# geom_vline(xintercept =  1.5, color = "grey75", alpha = 0.5, linetype = "dashed", linewidth = 0.2) +
+# geom_vline(xintercept = -1.5, color = "grey75", alpha = 0.5, linetype = "dashed", linewidth = 0.2) +
+
+
+```
+
+Test the function
+```{r}
+a_med_bugs <- c("GGB28379_SGB40959", "Streptococcus_danieliae", "GGB29685_SGB42494")
+
+plt <- summary_plot(
+  bugs     = a_med_bugs,
+  clr_data = data$a_clr,
+  meta     = data$a_meta
+) + theme(strip.text.y.left = element_blank())
+
+# ggsave("../figures/a_med_bugs.png", plt, width = 1.5, height = 1.2)
+# ggsave("../figures/a_med_bugs.svg", plt, width = 1.5, height = 1.2, device = "svg")
+```
+
+```{r}
+b_med_bug <- "bacterium_1XD42_54"
+
+plt <- summary_plot(
+  bugs     = b_med_bug,
+  clr_data = data$b_clr,
+  meta     = data$b_meta
+) + theme(strip.text.y.left = element_blank())
+
+# ggsave("../figures/b_med_bugb.png", plt, width = 1.5, height = 0.7)
+# ggsave("../figures/b_med_bug.svg", plt, width = 1.5, height = 0.7, device = "svg")
+```
+
+Get more info about these bugs (Family-level, more annotation)
+```{r}
+a_med_bugs
+data$taxonomy_map %>%
+  filter(Species %in% a_med_bugs)
+```
+They are all firmicutes. We have Clostridia, Bacilli, and unknown Firmicutes. On the Family-level, this is Eubacteriaceae, Streptococcaceae, and an unknown Family of Firmicutes.
+
+All species I've plotted in manuscript
+```{r}
+allspec <- c(
+  "Clostridiales_bacterium",
+  "Romboutsia_ilealis",
+  "Clostridium_cocleatum",
+  "Lachnospiraceae_bacterium_MD308",
+  "bacterium_1XD42_54",
+  "Alistipes_sp_DSM_112343",
+  "Lactobacillus_johnsonii",
+  "Lachnospiraceae_bacterium",
+  "Lachnospiraceae_bacterium_MD308",
+  "Eubacteriaceae_bacterium",
+  "Muribaculaceae_bacterium",
+  "GGB28991_SGB41705",
+  "GGB29685_SGB42494",
+  "GGB30461_SGB63209",
+  "GGB30463_SGB43537",
+  "GGB46159_SGB63927",
+  "GGB46159_SGB63927",
+  "GGB70852_SGB95305",
+  "GGB27878_SGB40312",
+  "GGB27918_SGB40356",
+  "GGB28379_SGB40959",
+  "Streptococcus_danieliae",
+  "GGB29685_SGB42494"
+)
+
+plot_bugs <- data$taxonomy_map %>%
+  filter(Species %in% allspec)
+
+unique(plot_bugs$Order)
+```
+
+# Just summary plot
+## cohort A: which microbes do we want to plot?
+```{r}
+bugs <- lmer_a$lmer_res %>%  # lmer$a_main$lmer_res %>%
+  mutate(
+    y = gsub("s__", "", y)
+  ) %>%
+  filter(
+    term == "blast",
+    signif == TRUE
+    ) %>%
+  pull(y)
+
+med_bugs <- c("GGB28379_SGB40959", "Streptococcus_danieliae")
+
+bugs <- c(bugs, med_bugs)
+bugs
+```
+
+Out of hits from A, how present are they in A versus B?
+```{r}
+a_ab <- data$a_relabund %>%
+  dplyr::select(all_of(bugs)) %>%
+  mutate(across(everything(), ~replace_na(., 0)))
+
+b_ab <- data$b_relabund %>%
+  dplyr::select(any_of(bugs)) %>%
+  mutate(across(everything(), ~replace_na(., 0)))
+
+
+return.presence(a_ab, colnames(a_ab))
+return.presence(b_ab, colnames(b_ab))
+```
+
+
+```{r}
+bug_data <- data$a_clr %>%
+  dplyr::select(all_of(bugs)) %>%
+  scale() %>% as.data.frame() %>%       # scale
+  rownames_to_column("seq_name") %>%
+  left_join(
+    data$a_meta %>%
+      dplyr::select(c("seq_name", "inj_trt_group")),
+    by = "seq_name"
+    ) %>%
+  column_to_rownames("seq_name")
+  
+plot_bug <- bug_data %>%
+  pivot_longer(
+    cols = -inj_trt_group,
+    names_to = "microbe",
+    values_to = "relab"
+  )
+
+head(plot_bug)
+```
+
+```{r}
+summary_bug <- plot_bug %>%
+  group_by(microbe, inj_trt_group) %>%
+  summarise(
+    mean = mean(relab, na.rm = TRUE),
+    se   = sd(relab, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  )
+
+summary_bug <- summary_bug %>%
+  # define custom factor order for bugs
+  mutate(
+    # make an ordered factor so all groups of a microbe stay together
+    y_label = factor(
+      paste(microbe, inj_trt_group, sep = "_"),
+      levels = summary_bug %>%
+        arrange(microbe, desc(inj_trt_group)) %>%                       # descending groups
+        transmute(lvl = paste(microbe, inj_trt_group, sep = "_")) %>%
+        pull(lvl)
+    ),
+    inj_trt_group = fct_rev(inj_trt_group),      # reverse order groups (top-bottom)
+  )
+
+head(summary_bug)
+```
+Labels for y-axis
+```{r}
+# compute midpoints for each variable's block
+microbe_labels <- summary_bug %>%
+  group_by(microbe) %>%
+  summarise(y_mid = mean(as.numeric(y_label)))
+
+# Define alternating shading bands
+shade_bands <- summary_bug %>%
+  group_by(microbe) %>% 
+  arrange(by = microbe) %>%
+  mutate(
+    microbe = as.factor(microbe),
+    band_id = as.numeric(microbe),
+    fill = ifelse(band_id %% 2 == 1, "grey95", "white")
+    )
+```
+
+Plot
+```{r}
+xlim <- max(abs(c(summary_bug$mean + summary_bug$se, summary_bug$mean - summary_bug$se))) * 1.01
+
+plt <- ggplot(summary_bug, aes(x = mean, y = inj_trt_group, color = inj_trt_group)) +
+  geom_rect(
+    data = shade_bands,
+    aes(
+      xmin = -Inf, xmax = Inf,
+      ymin = -Inf, ymax = Inf,
+      fill = fill
+    ),
+    inherit.aes = FALSE,
+    color = NA
+  ) +
+  # geom_vline(xintercept =  0.0, color = "grey25", alpha = 0.7, linetype = "dashed", linewidth = 0.2) +
+  # geom_vline(xintercept =  1.0, color = "grey50", alpha = 0.7, linetype = "dashed", linewidth = 0.2) +
+  # geom_vline(xintercept = -1.0, color = "grey50", alpha = 0.7, linetype = "dashed", linewidth = 0.2) +
+  # geom_vline(xintercept =  0.5, color = "grey75", alpha = 0.5, linetype = "dashed", linewidth = 0.2) +
+  # geom_vline(xintercept = -0.5, color = "grey75", alpha = 0.5, linetype = "dashed", linewidth = 0.2) +
+  # geom_vline(xintercept =  1.5, color = "grey75", alpha = 0.5, linetype = "dashed", linewidth = 0.2) +
+  # geom_vline(xintercept = -1.5, color = "grey75", alpha = 0.5, linetype = "dashed", linewidth = 0.2) +
+  geom_point(size = 1.0) +
+  geom_linerange(aes(xmin = mean - se, xmax = mean + se), linewidth = 0.25) +
+  scale_fill_identity() +
+  # geom_errorbarh(aes(xmin = mean - se, xmax = mean + se), linewidth = 0.3, height = 0.5) +
+  scale_color_manual(values = four_colors) +
+  facet_grid(
+    rows   = vars(microbe),
+    # cols   = vars(location),
+    # scales = "free_y",
+    space  = "free_y",
+    switch = "y"            # plot y-labels on left-hand side (instead of right)
+    ) +
+  scale_x_continuous(limits = c(-xlim, xlim)) +
+  geom_vline(xintercept =  0.0, color = "grey25", alpha = 0.7, linetype = "dashed", linewidth = 0.2) +
+  labs(x = NULL, y = NULL) +
+  theme_minimal(base_size = 14) +
+  theme(
+    strip.placement   = "outside",
+    strip.text.y.left = element_text(angle = 0, hjust = 1),
+    panel.spacing.y   = unit(0.1, "lines"),   # try 1-3 "lines" of spacing
+    panel.spacing.x   = unit(0.1, "lines"),   # put close together
+    axis.text.y       = element_blank(),
+    axis.ticks.y      = element_blank(),
+    axis.line.x       = element_line(colour = "black", linewidth = 0.4),
+    panel.grid        = element_blank(),
+    panel.background  = element_blank(),
+    legend.position   = "none"
+  )
+
+plt
+
+# ggsave("../figures/bug_summary_test.png", plt, width = 4.5, height = 7)
+# ggsave("../figures/bug_summary.svg", plt, width = 4.5, height = 7, device = "svg")
+
+```
+# summary + lmer plot
+## Try adding lmer plot as well!
+
+```{r}
+bugs <- lmer_a$lmer_res %>% # lmer$a_main$lmer_res %>%
+  mutate(y = gsub("s__", "", y)) %>%
+  filter(
+    term == "blast",
+    signif == TRUE
+    ) %>%
+  pull(y)
+
+bugs
+```
+
+
+Group mean abundance dataframe
+```{r}
+group_abund <- data$a_clr %>%
+  dplyr::select(all_of(bugs)) %>%
+  scale() %>% as.data.frame() %>%       # scale/center CLR values
+  rownames_to_column("seq_name") %>%
+  left_join(                            # join with metadata
+    data$a_meta %>%
+      dplyr::select(c("seq_name", "inj_trt_group")),
+    by = "seq_name"
+    ) %>%
+  column_to_rownames("seq_name") %>%
+  pivot_longer(
+    cols = -inj_trt_group,
+    names_to = "microbe",
+    values_to = "relab"
+  ) %>%
+  group_by(microbe, inj_trt_group) %>%
+  summarise(
+    mean = mean(relab, na.rm = TRUE),
+    se   = sd(relab, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    panel = "GroupMeans",
+    y_label = paste(microbe, inj_trt_group, sep = "_")
+  )
+
+head(group_abund)
+```
+Blast effect CI dataframe
+```{r}
+blastCI <- lmer_a$lmer_res %>% # lmer$a_main$lmer_res %>%
+  mutate(y = gsub("s__", "", y)) %>%
+  filter(
+    term == "blast",
+    y %in% bugs
+    ) %>%
+  mutate(microbe = fct_reorder(factor(y), estimate)) %>%
+  transmute(
+    microbe,
+    # inj_trt_group = term,                     # for consistency in grouping/color
+    mean = estimate,                            # match variable name
+    se   = se,
+    y_label = paste(microbe, term, sep = "_"),  # this is for if you have multiple terms
+    panel = "Regression"                        # tag for facet column
+  )
+
+# save this bug order?
+microbe_levels <- levels(blastCI$microbe)
+
+head(blastCI)
+```
+
+get order-level annotations
+```{r}
+data$taxonomy_map %>%
+  filter(Species %in% microbe_levels)
+
+microbe_levels
+```
+
+```{r}
+combined <- bind_rows(group_abund, blastCI) %>%
+  mutate(
+    microbe = factor(microbe, levels = microbe_levels),
+    inj_trt_group = fct_rev(inj_trt_group)
+    )
+
+
+# Define alternating shading bands
+shade_bands <- combined %>%
+  group_by(microbe) %>% 
+  arrange(by = microbe) %>%
+  mutate(
+    microbe = as.factor(microbe),
+    band_id = as.numeric(microbe),
+    fill = ifelse(band_id %% 2 == 1, "grey95", "white")
+    )
+
+head(combined)
+head(shade_bands)
+```
+Define alternating shading bands
+cyto_bands <- cyto_summary %>%
+  distinct(variable, location, inj_trt_group) %>%
+  group_by(variable) %>% 
+  arrange(by = variable) %>%
+  mutate(
+    band_id = as.numeric(variable),
+    fill = ifelse(band_id %% 2 == 1, "grey95", "white")
+  ) %>%
+  ungroup()
+
+```{r}
+plt <- ggplot(combined, aes(x = mean, y = inj_trt_group, color = inj_trt_group)) +
+  geom_rect(
+    data = shade_bands,
+    aes(
+      xmin = -Inf, xmax = Inf,
+      ymin = -Inf, ymax = Inf,
+      fill = fill
+    ),
+    inherit.aes = FALSE,
+    color = NA
+  ) +
+  geom_point(size = 1.0) +
+  geom_linerange(aes(xmin = mean - se, xmax = mean + se), linewidth = 0.25) +
+  scale_fill_identity() +
+  scale_color_manual(values = four_colors) +
+  facet_grid(
+    rows   = vars(microbe),
+    cols   = vars(panel),
+    space  = "free_y",
+    scales = "free_x",
+    switch = "y"
+  ) +
+  # scale_x_continuous(limits = c(-xlim, xlim)) +
+  labs(x = NULL, y = NULL) +
+  theme_minimal(base_size = 14) +
+  theme(
+    strip.placement   = "outside",
+    strip.text.y.left = element_text(angle = 0, hjust = 1),
+    panel.spacing     = unit(0.1, "lines"),
+    axis.text.y       = element_blank(),
+    axis.ticks.y      = element_blank(),
+    axis.ticks.x      = element_line(color = "black", linewidth = 0.4),
+    axis.line.x       = element_line(colour = "black", linewidth = 0.4),
+    panel.grid        = element_blank(),
+    panel.background  = element_blank(),
+    legend.position   = "none"
+  )
+
+plt
+```
+Fiddling with scaling parameters
+```{r}
+row_height <- 0.4  # inches per microbe row (adjust for your density)
+n_microbes <- nlevels(combined$microbe)
+height_in <- n_microbes * row_height
+
+ggsave(
+  "../figures/A_group_DA.svg",
+  plot = plt,
+  width = 6,           # fixed width (inches)
+  height = height_in,  # scales with number of rows
+  units = "in",
+  device = "svg",
+  dpi = 300
+)
+
+```
+
+# Cohort B
+```{r}
+bugs <- lmer_b$lmer_res %>% # lmer$a_main$lmer_res %>%
+  mutate(y = gsub("s__", "", y)) %>%
+  filter(
+    term == "blast",
+    signif == TRUE
+    ) %>%
+  pull(y)
+
+bugs
+```
+
+Group mean abundance dataframe
+```{r}
+group_abund <- data$b_clr %>%
+  dplyr::select(all_of(bugs)) %>%
+  scale() %>% as.data.frame() %>%       # scale/center CLR values
+  rownames_to_column("seq_name") %>%
+  left_join(                            # join with metadata
+    data$b_meta %>%
+      dplyr::select(c("seq_name", "inj_trt_group")),
+    by = "seq_name"
+    ) %>%
+  column_to_rownames("seq_name") %>%
+  pivot_longer(
+    cols = -inj_trt_group,
+    names_to = "microbe",
+    values_to = "relab"
+  ) %>%
+  group_by(microbe, inj_trt_group) %>%
+  summarise(
+    mean = mean(relab, na.rm = TRUE),
+    se   = sd(relab, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    panel = "GroupMeans",
+    y_label = paste(microbe, inj_trt_group, sep = "_")
+  )
+
+head(group_abund)
+```
+Blast effect CI dataframe
+```{r}
+blastCI <- lmer_b$lmer_res %>% # lmer$a_main$lmer_res %>%
+  mutate(y = gsub("s__", "", y)) %>%
+  filter(
+    term == "blast",
+    y %in% bugs
+    ) %>%
+  mutate(microbe = fct_reorder(factor(y), estimate)) %>%
+  transmute(
+    microbe,
+    # inj_trt_group = term,                     # for consistency in grouping/color
+    mean = estimate,                            # match variable name
+    se   = se,
+    y_label = paste(microbe, term, sep = "_"),  # this is for if you have multiple terms
+    panel = "Regression"                        # tag for facet column
+  )
+
+# save this bug order?
+microbe_levels <- levels(blastCI$microbe)
+
+head(blastCI)
+```
+
+```{r}
+combined <- bind_rows(group_abund, blastCI) %>%
+  mutate(
+    microbe = factor(microbe, levels = microbe_levels),
+    inj_trt_group = fct_rev(inj_trt_group)
+    )
+
+
+# Define alternating shading bands
+shade_bands <- combined %>%
+  group_by(microbe) %>% 
+  arrange(by = microbe) %>%
+  mutate(
+    microbe = as.factor(microbe),
+    band_id = as.numeric(microbe),
+    fill = ifelse(band_id %% 2 == 1, "grey95", "white")
+    )
+
+head(combined)
+head(shade_bands)
+```
+
+```{r}
+plt <- ggplot(combined, aes(x = mean, y = inj_trt_group, color = inj_trt_group)) +
+  geom_rect(
+    data = shade_bands,
+    aes(
+      xmin = -Inf, xmax = Inf,
+      ymin = -Inf, ymax = Inf,
+      fill = fill
+    ),
+    inherit.aes = FALSE,
+    color = NA
+  ) +
+  geom_point(size = 1.0) +
+  geom_linerange(aes(xmin = mean - se, xmax = mean + se), linewidth = 0.25) +
+  scale_fill_identity() +
+  scale_color_manual(values = four_colors) +
+  facet_grid(
+    rows   = vars(microbe),
+    cols   = vars(panel),
+    space  = "free_y",
+    scales = "free_x",
+    switch = "y"
+  ) +
+  # scale_x_continuous(limits = c(-xlim, xlim)) +
+  labs(x = NULL, y = NULL) +
+  theme_minimal(base_size = 14) +
+  theme(
+    strip.placement   = "outside",
+    strip.text.y.left = element_text(angle = 0, hjust = 1),
+    panel.spacing     = unit(0.1, "lines"),
+    axis.text.y       = element_blank(),
+    axis.ticks.y      = element_blank(),
+    axis.ticks.x      = element_line(color = "black", linewidth = 0.4),
+    axis.line.x       = element_line(colour = "black", linewidth = 0.4),
+    panel.grid        = element_blank(),
+    panel.background  = element_blank(),
+    legend.position   = "none"
+  )
+
+plt
+```
+Fiddling with scaling parameters
+```{r}
+row_height <- 0.4  # inches per microbe row (adjust for your density)
+n_microbes <- nlevels(combined$microbe)
+height_in <- n_microbes * row_height
+
+ggsave(
+  "../figures/B_group_DA.svg",
+  plot = plt,
+  width = 6,           # fixed width (inches)
+  height = height_in,  # scales with number of rows
+  units = "in",
+  device = "svg",
+  dpi = 300
+)
+
+ggsave(
+  "../figures/B_group_DA.png",
+  plot = plt,
+  width = 6,           # fixed width (inches)
+  height = height_in,  # scales with number of rows
+  units = "in",
+  # device = "svg",
+  dpi = 300
+)
+```
+
+# Workspace
+Code from `cytokine_plot.Rmd`
+```{r}
+cyto_plot <- ggplot(cyto_summary, aes(x = mean, y = inj_trt_group, color = inj_trt_group)) +
+  geom_rect(
+    data = cyto_bands,
+    aes(
+      xmin = -Inf, xmax = Inf,
+      ymin = -Inf, ymax = Inf,
+      fill = fill
+    ),
+    inherit.aes = FALSE,
+    color = NA
+  ) +
+  geom_vline(xintercept =  0.0, color = "grey25", alpha = 0.7, linetype = "dashed", linewidth = 0.2) +
+  geom_point(size = 1.0) +
+  geom_linerange(aes(xmin = mean - se, xmax = mean + se), linewidth = 0.25) +
+  scale_fill_identity() +
+  # geom_errorbarh(aes(xmin = mean - se, xmax = mean + se), linewidth = 0.3, height = 0.5) +
+  scale_color_manual(values = four_colors) +
+  facet_grid(
+    rows   = vars(variable),
+    cols   = vars(location),
+    # scales = "free_y",
+    space  = "free_y",
+    switch = "y"            # plot y-labels on left-hand side (instead of right)
+    ) +
+  scale_x_continuous(limits = c(-1.6, 1.6)) +
+  labs(x = NULL, y = NULL) +
+  theme_minimal(base_size = 14) +
+  theme(
+    strip.placement   = "outside",
+    strip.text.y.left = element_text(angle = 0, hjust = 1),
+    panel.spacing.y   = unit(0.1, "lines"),   # try 1-3 "lines" of spacing
+    panel.spacing.x   = unit(0.1, "lines"),   # put close together
+    axis.text.y       = element_blank(),
+    axis.ticks.y      = element_blank(),
+    axis.line.x       = element_line(colour = "black", linewidth = 0.4),
+    panel.grid        = element_blank(),
+    panel.background  = element_blank(),
+    legend.position   = "none"
+  )
+
+```
+
+# Tried to make it better with Chat, but it got more complicated due to facet grid
+```{r}
+# Create numeric y positions
+group_levels <- levels(group_abund$inj_trt_group)
+n_groups <- length(group_levels)
+
+combined <- bind_rows(group_abund, blastCI) %>%
+  mutate(
+    microbe = factor(microbe, levels = microbe_levels),
+    inj_trt_group = fct_rev(inj_trt_group),
+    y_pos = case_when(                  # numeric y position: 1, 2, 3, 4 for groups; midpoint for regression
+      panel == "GroupMeans" ~ scales::rescale(as.numeric(inj_trt_group),
+                                              to = c(1.2, n_groups - 0.2)),  # add top/bottom margins
+      panel == "Regression" ~ (n_groups + 1) / 2,
+      TRUE ~ NA_real_
+    )
+  )
+
+# Shading bands (optional)
+shade_bands <- combined %>%
+  distinct(microbe) %>%
+  mutate(
+    band_id = as.numeric(microbe),
+    fill = ifelse(band_id %% 2 == 1, "grey95", "white")
+  )
+
+# Plot
+plt <- ggplot(combined, aes(x = mean, y = y_pos)) +
+  geom_rect(
+    data = shade_bands,
+    aes(xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf, fill = fill),
+    inherit.aes = FALSE, color = NA
+  ) +
+  geom_linerange(
+    aes(
+      xmin = mean - se, xmax = mean + se,
+      color = if_else(panel == "GroupMeans", inj_trt_group, NA_character_)
+    ),
+    linewidth = 0.25
+  ) +
+  geom_point(
+    aes(color = if_else(panel == "GroupMeans", inj_trt_group, NA_character_)),
+    size = 1
+  ) +
+  geom_point(
+    data = combined %>% filter(panel == "Regression"),
+    color = "black", size = 1
+  ) +
+  geom_linerange(
+    data = combined %>% filter(panel == "Regression"),
+    aes(xmin = mean - se, xmax = mean + se),
+    color = "grey40", linewidth = 0.25
+  ) +
+  scale_fill_identity() +
+  scale_color_manual(values = four_colors, na.value = "black") +
+  facet_grid(
+    rows   = vars(microbe),
+    cols   = vars(panel),
+    space  = "free_y",
+    scales = "free_x",
+    switch = "y"
+  ) +
+  labs(x = NULL, y = NULL) +
+  theme_minimal(base_size = 14) +
+  theme(
+    strip.placement   = "outside",
+    strip.text.y.left = element_text(angle = 0, hjust = 1),
+    panel.spacing.y   = unit(0.4, "lines"),
+    panel.spacing.x   = unit(0.2, "lines"),
+    axis.text.y       = element_blank(),
+    axis.ticks.y      = element_blank(),
+    axis.line.x       = element_line(colour = "black", linewidth = 0.4),
+    panel.grid        = element_blank(),
+    panel.background  = element_blank(),
+    legend.position   = "none"
+  )
+
+plt
+```
+
