@@ -1,0 +1,39 @@
+# R/RStudio
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+
+# knitr/cache
+*_cache/
+cache/
+*_files/
+
+# generated data
+data/intermediate/
+data/final/
+data/**/*.rds
+
+# controlled/raw data not tracked
+data/raw/metadata/
+data/raw/metaphlan/
+
+# Raw M-DACT Source code pending permission from authors
+R/mdact_source.R
+
+# results, optional: track or ignore depending on preference
+# results/figures/
+# results/tables/
+
+# local archive
+archive/
+local_archive/
+scratch/
+tmp/
+
+# system files
+.DS_Store
+Thumbs.db
+
+# logs
+*.log
