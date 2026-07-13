@@ -23,39 +23,98 @@ presence_by_category <- function(data, category_col) {
     )
 }
 
+# filter_and_clr <- function(
+#     bug_info,
+#     counts,
+#     total_presence      = 0.3,
+#     batch_presence      = 0.1,
+#     impute_method       = "GBM",
+#     filt_before_clr     = TRUE
+# ) {
+#   
+#   filt_bugs <- bug_info %>% filter(
+#     pres_total     >= total_presence,
+#     pres_batch1    >= batch_presence,
+#     pres_batch3    >= batch_presence) %>%
+#     pull(microbe)
+#   
+#   if (filt_before_clr) {
+#     filt_counts <- counts %>%
+#       dplyr::select(any_of(filt_bugs))
+#   } else {
+#     filt_counts <- counts
+#   }
+#   
+#   imputed_counts <- zCompositions::cmultRepl(filt_counts, label = 0, method = impute_method, z.delete = FALSE)
+#   gm <- exp(rowMeans(log(imputed_counts)))
+#   clr_mat <- log(imputed_counts) - log(gm)
+#   clr_df_raw <- data.frame(clr_mat)
+#   
+#   res <- list(
+#     "clr_df_raw" = clr_df_raw,
+#     "filt_bugs" = filt_bugs
+#   )
+#   
+#   return(res)
+# }
+
 filter_and_clr <- function(
     bug_info,
     counts,
-    total_presence      = 0.3,
-    batch_presence      = 0.1,
-    impute_method       = "GBM",
-    filt_before_clr     = TRUE
+    total_presence = 0.3,
+    batch_presence = 0.1,
+    batch_mode = c("all_batches", "min_batches"),
+    min_batches = 2,
+    batch_cols = NULL,
+    impute_method = "GBM",
+    filt_before_clr = TRUE,
+    scale_clr = FALSE
 ) {
+  batch_mode <- match.arg(batch_mode)
   
-  filt_bugs <- bug_info %>% filter(
-    pres_total     >= total_presence,
-    pres_batch1    >= batch_presence,
-    pres_batch3    >= batch_presence) %>%
-    pull(microbe)
-  
-  if (filt_before_clr) {
-    filt_counts <- counts %>%
-      dplyr::select(any_of(filt_bugs))
-  } else {
-    filt_counts <- counts
+  if (is.null(batch_cols)) {
+    batch_cols <- grep("^pres_batch", names(bug_info), value = TRUE)
   }
   
-  imputed_counts <- zCompositions::cmultRepl(filt_counts, label = 0, method = impute_method, z.delete = FALSE)
-  gm <- exp(rowMeans(log(imputed_counts)))
-  clr_mat <- log(imputed_counts) - log(gm)
-  clr_df_raw <- data.frame(clr_mat)
+  if (batch_mode == "all_batches") {
+    filt_bugs <- bug_info %>%
+      dplyr::filter(
+        pres_total >= total_presence,
+        dplyr::if_all(dplyr::all_of(batch_cols), ~ .x >= batch_presence)
+      ) %>%
+      dplyr::pull(microbe)
+    
+  } else if (batch_mode == "min_batches") {
+    filt_bugs <- bug_info %>%
+      dplyr::filter(
+        pres_total >= total_presence,
+        rowSums(dplyr::across(dplyr::all_of(batch_cols), ~ .x >= batch_presence), na.rm = TRUE) >= min_batches
+      ) %>%
+      dplyr::pull(microbe)
+  }
   
-  res <- list(
-    "clr_df_raw" = clr_df_raw,
-    "filt_bugs" = filt_bugs
+  filt_counts <- if (filt_before_clr) {
+    counts %>% dplyr::select(dplyr::any_of(filt_bugs))
+  } else {
+    counts
+  }
+  
+  imputed_counts <- zCompositions::cmultRepl(
+    filt_counts, label = 0, method = impute_method, z.delete = FALSE
   )
   
-  return(res)
+  gm <- exp(rowMeans(log(imputed_counts)))
+  clr_mat <- log(imputed_counts) - log(gm)
+  clr_df <- as.data.frame(clr_mat)
+  
+  if (scale_clr) {
+    clr_df <- as.data.frame(scale(clr_df))
+  }
+  
+  list(
+    clr_df_raw = clr_df,
+    filt_bugs = filt_bugs
+  )
 }
 
 join_bugs_and_div <- function(

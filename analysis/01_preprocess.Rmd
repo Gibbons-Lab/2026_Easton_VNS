@@ -5,23 +5,40 @@ date: '2026-05-13'
 output:
 ---
 
-Outputs: `data/1_preprocessed/01_preprocess_metadata_cleaned_meta.rds`
+## Inputs
+- `data/raw/VNS_behavior_250314.xlsx`
+- `data/raw/VNS_datafinalpaper_240513.xlsx`
+- `data/raw/metaphlan/*.txt`
+
+## Outputs
+- `data/intermediate/01_meta_A.rds`
+- `data/intermediate/01_meta_B.rds`
+
+Outputs contain processed microbiome data, metadata, cytokine PCA,
+and higher-order taxonomic information for species assignments
 
 ```{r "setup", include=FALSE}
+source(here::here("R", "paths.R"))
 knitr::opts_chunk$set(echo = TRUE, cache=TRUE)
-knitr::opts_knit$set(root.dir = "/proj/gibbons/2024_easton_vns/data")
-options(digits = 10) ## Formats output to 10 digits
+knitr::opts_knit$set(root.dir = PROJECT_ROOT)
+options(digits = 10)
 library(tidyverse)
 library(data.table)
 library(magrittr)
 library(readxl)
-source("/proj/gibbons/2024_easton_vns/workflow/functions/utils.R")
+library(janitor)
+source(here::here("R", "utils.R"))
+source(here::here("R", "cleaning.R"))
+source(here::here("R", "microbiome_preprocess.R"))
+source(here::here("R", "diversity_utils.R"))
+source(here::here("R", "constants.R"))
+source(here::here("R", "pca_utils.R"))
 ```
 
 ## Prepare Metadata
 ```{r read}
 # updated behavior data
-pd_data <- read_xlsx("metadata/VNS_behavior_250314.xlsx") %>%
+pd_data <- read_xlsx(here::here("data", "raw", "VNS_behavior_250314.xlsx")) %>%
   dplyr::select(animal_code, startle_habituation, startle_PPI, PD_choice,
                 EtOH_24h_intakeave, EtOH_pref_24h, EtOH_8pm_intakeave) %>%
   rename(PD_choice_filt = PD_choice,
@@ -30,7 +47,7 @@ pd_data <- read_xlsx("metadata/VNS_behavior_250314.xlsx") %>%
          EtOH_8pm_intakeave_final = EtOH_8pm_intakeave)
 
 # rest of data
-metadata <- read_xlsx("metadata/VNS_datafinalpaper_240513.xlsx") %>%
+metadata <- read_xlsx(here::here("data", "raw", "VNS_datafinalpaper_240513.xlsx")) %>%
   dplyr::select(where(~ any(!is.na(.)))) %>%           # remove empty cols
   mutate(animal_code = as.integer(animal_code)) %>%    # convert animal_code to int
   dplyr::select(-matches("p__|o__")) %>%               # remove old microbiome-related columns
@@ -63,11 +80,13 @@ metadata <- read_xlsx("metadata/VNS_datafinalpaper_240513.xlsx") %>%
   arrange(seq_name) %>%
   # replace special characters for later processing, because I'm not sure how
   # they are handled in Linux shell scripts
-  rename(
-    c("serum_IL-1a" = `serum_IL-1α`,
-      "brain_IL-1a" = `brain_IL-1α`,
-      "brain_INF_gamma" = `brain_INFγ`)
-  ) %>%
+  rename_with(.fn = clean_vec) %>%
+  rename(`brain_IFNg` = `brain_INFg`) %>%       # it's IFN, not INF
+  # rename(
+  #   c("serum_IL-1a" = `serum_IL-1α`,
+  #     "brain_IL-1a" = `brain_IL-1α`,
+  #     "brain_IFN_gamma" = `brain_INFγ`)
+  # ) %>%
   # add a feature called "inj_trt_group" which has our 4 treatment groups
   mutate(
     inj_trt_group = factor(
@@ -77,47 +96,54 @@ metadata <- read_xlsx("metadata/VNS_datafinalpaper_240513.xlsx") %>%
     blast         = ifelse(Injury    == "Blast",                   1, 0),
     vns           = ifelse(Treatment == "VNS",                     1, 0),
     blast_and_vns = ifelse(Injury == "Blast" & Treatment == "VNS", 1, 0),
-    seq_name      = as.character(seq_name),
+    seq_name      = as.character(seq_name)
   )
 ```
 
 ```{r}
-clean_meta <- function(meta) {
-  meta %>%
-    mutate(Round_main    = droplevels(Round_main)) %>%
-    dplyr::select(where(~ !all(is.na(.)))) %>%  # same as meta <- meta[, colSums(is.na(meta)) != nrow(meta)]
-    relocate(c("cohort", "inj_trt_group"), .before = 3) %>%
-    relocate(c("animal_code", "seq_name"), .before = 1) %>%
-    dplyr::select(-c("cohort", "file_name", "feces_tp"))
-}
-
 meta_a <- clean_meta(filter(metadata, cohort == "A"))
 meta_b <- clean_meta(filter(metadata, cohort == "B"))
-
 meta_b_smaller <- meta_b %>%
   dplyr::select(-any_of(extra_B_cols))
 ```
 
+# Cytokine PCA
+Tidy data import/PCA
+Here, I'm using a "helper" function `run_.pca.join_pca` to automatically
+   • filter to one cohort
+   • select & scale a block of columns
+   • run PCA
+   • pick PCs ≥ threshold
+   • augment metadata with those PCs
 
-Note: The extra mouse was 1444 (sham-sham). I accidentally used `EtOH_pref_24h` instead of `EtOH_pref_24h_final`. 
-
-Save
-```{r, eval = FALSE}
-# Old way:
-# saveRDS(metadata, "1_preprocessed/metadata.rds")
-
-# New organized way:
-save_output(metadata, "cleaned_meta", "data/1_preprocessed")
-```
-
-
-# Preprocess Microbiome data
+The resulting object is a list, including
+   • meta: augmented metadata df including PCs ≥ threshold `res$meta$PCx`
+   • pca: the output of prcomp() `res$pca`
+   • variance: the variance explained per PC `res$variance`
+   • loadings: loadings of each feature in each PC `res$loadings`
+   
 ```{r}
-seq_a <- metadata %>% filter(cohort == "A") %>% pull(seq_name)
-seq_b <- metadata %>% filter(cohort == "B") %>% pull(seq_name)
+res_A <- run_pca(meta_a, block = "serum|brain")
+
+# extract PCs explaining ≥ 5% total variance
+ck_pcs <- res_A$vars %>%
+  filter(`Proportion of Variance` >= 0.05) %>%
+  pull(PC)
+
+pca_loadings <- res_A$loadings %>%
+  dplyr::select(any_of(c("Feature", ck_pcs)))
+
+pca_scores <- res_A$meta %>%
+  dplyr::select(any_of(c("seq_name", ck_pcs)))
+
+# update meta_a to include PCs
+meta_a_withPCs <- meta_a %>%
+  left_join(pca_scores, by = "seq_name")
 ```
 
-Preprocess new MetaPhlAn output myself - get *species-level count table*
+# Microbiome
+### Extract species-level counts
+Process MetaPhlAn output into *species-level count table*
 ```{r}
 files <- list.files("/proj/gibbons/2024_easton_vns/metaphlan_2/metaphlan", 
                     pattern = "_metaphlan\\.txt$", full.names = TRUE)
@@ -184,14 +210,14 @@ s_counts <- s_long %>%
 
 s_relabund <- s_long %>%
   pivot_wider(., id_cols = "seq_name", names_from = "clade_name", values_from = "relative_abundance")
-
 ```
-
-Rarefy count table to lowest n_reads (for each cohort)
-  cohort A worst depth is sample *1413* (575,229 reads), followed by *1419*
-  cohort B worst depth is sample *1766* (154,195 reads), followed by *1765* <- keep an eye on this 1766 - might need to drop?
   
 ```{r}
+# Get sequence IDs for each cohort
+seq_a <- metadata %>% filter(cohort == "A") %>% pull(seq_name)
+seq_b <- metadata %>% filter(cohort == "B") %>% pull(seq_name)
+
+# separate into 2 raw count tables
 counts_both <- s_counts %>%
   filter(seq_name %in% c(seq_a, seq_b)) %>%
   dplyr::select(where(~ !all(is.na(.)))) %>%
@@ -219,10 +245,10 @@ relabund_b <- s_relabund %>%
   dplyr::select(where(~ !all(is.na(.))))
 ```
 
-## Do rarefaction by hand
-(this uses my own function `rarefy`, which is in `shannon_div_functions.R`)
+### Rarefy counts
+for calculation of alpha and beta diversity metrics
 ```{r}
-set.seed(145)
+set.seed(seeds$rarefy)
 raref_both <- rarefy(counts_both)  # 256 species
 raref_a <- rarefy(counts_a)        # 214 species
 raref_b <- rarefy(counts_b)        # 231 species
@@ -240,9 +266,11 @@ hist(presence_both)
 
 
 
-## Alpha Diversity Metrics
-Calculate per-sample Alpha Diversity indices:
-    *Shannon Index (richness + evenness), Berger-Parker Dominance, Observed features (richness)*
+### Alpha Diversity
+Calculate per-sample Alpha Diversity indices at the species level
+    *Shannon Index (richness + evenness)*
+    *Berger-Parker Dominance*
+    *Observed features (richness)*
 ```{r}
 alph_a <- alpha_div(raref_a)
 alph_b <- alpha_div(raref_b)
@@ -251,8 +279,9 @@ alph_a
 alph_b
 ```
 
-## Get cross-sectional information on each microbe
- (presence across treatments, within treatment groups)
+### Get cross-sectional information on each microbe
+i.e. presence across treatments, within treatment groups
+     for use during filtering
 ```{r}
 a_bug_infos <- list(
   "presence_df" = counts_a %>%
@@ -286,20 +315,60 @@ a_bug_infos$info_df <- a_bug_infos$presence_df %>%
     pres_batch1 = `1`,
     pres_batch3 = `3`
   )
-
 ```
 
+```{r}
+b_bug_infos <- list(
+  "presence_df" = counts_b %>%
+    mutate(across(everything(), ~ . != 0)) %>%
+    rownames_to_column("seq_name"),
 
-## Processing
+  "per_sample_presence" = counts_b %>%
+    mutate(across(everything(), ~ . != 0)) %>%
+    {rowSums(.) / ncol(.)}
+)
+
+b_bug_infos$presence_by_batch <- meta_b %>%
+  transmute(seq_name, Round_main) %>%
+  left_join(b_bug_infos$presence_df, by = "seq_name") %>%
+  column_to_rownames("seq_name") %>%
+  presence_by_category(     # defined in shannon_div_functions
+    data = .,
+    category_col = "Round_main"
+  )
+
+b_bug_infos$info_df <- b_bug_infos$presence_df %>%
+  dplyr::select(-seq_name) %>%
+  summarize(across(everything(), ~ sum(.x) / n())) %>% # calculate total presence
+  pivot_longer(
+    everything(),
+    names_to = "microbe",
+    values_to = "pres_total"
+  ) %>%
+  left_join(b_bug_infos$presence_by_batch, by = "microbe") %>%
+  rename(
+    pres_batch4 = `4`,
+    pres_batch5 = `5`,
+    pres_batch6 = `6`,
+    pres_batch7 = `7`,
+    pres_batch8 = `8`,
+    pres_batch9 = `9`
+  )
+
+b_bug_infos$info_df
+```
+
+### Do CLR
 ```{r}
 a_clr <- filter_and_clr(
   bug_info = a_bug_infos$info_df,
   counts = counts_a,
   total_presence = 0.3,
   batch_presence = 0.1,
+  batch_mode = "all_batches",
   impute_method = "GBM",
   filt_before_clr = TRUE,
-  ctrl_batch = TRUE
+  scale_clr = FALSE
 )
 
 a_features <- join_bugs_and_div(
@@ -310,10 +379,64 @@ a_features <- join_bugs_and_div(
 a_features
 ```
 
-Merge all data into one df 
-  Treatments (exposures) are binary
-  Microbes are filtered, CLR-transformed, and then z-scored
-  Outcome variables are z-scored
-  *Alpha diversity is z-scored!*
+
   
 `a_features` is now very similar to `"../data/processed/A_clr_df_withalpha_0206.rds"`, except it doesn't have metadata or cytokine PCs yet.
+
+```{r}
+b_clr <- filter_and_clr(
+  bug_info = b_bug_infos$info_df,
+  counts = counts_b,
+  total_presence = 0.30,
+  batch_presence = 0.1,
+  batch_mode = "min_batches",
+  min_batches = 2,
+  impute_method = "GBM",
+  filt_before_clr = TRUE,
+  scale_clr = TRUE
+)
+
+b_features <- join_bugs_and_div(
+  raw_clr_df = b_clr$clr_df_raw,
+  raw_alpha_df = alph_b
+)
+
+b_features
+```
+
+
+# SAVE
+```{r}
+a_species_data <- list(
+  "meta"           = meta_a_withPCs, # contains animal_code and seq_id
+  "counts"         = counts_a,       # row.names = seq_id
+  "counts_raref"   = raref_a,
+  "relative"       = relabund_a,
+  "presence"       = a_bug_infos$presence_df,
+  "presence_stats" = a_bug_infos$info_df,
+  "clr_alpha"      = a_features$raw_feat,
+  "clr_norm"       = a_features$norm_feat,
+  "taxonomy_map"   = full_taxonomy,
+  "PCA_loadings"   = pca_loadings,
+  "PCA_variance"   = ck_pc_df,
+  "PCA_raw"        = res_A$pca
+)
+
+b_species_data <- list(
+  "meta"           = meta_b_smaller, # contains animal_code and seq_id
+  "counts"         = counts_b,       # row.names = seq_id
+  "counts_raref"   = raref_b,
+  "relative"       = relabund_b,
+  "presence"       = b_bug_infos$presence_df,
+  "presence_stats" = b_bug_infos$info_df,
+  "clr_alpha"      = b_features$raw_feat,
+  "clr_norm"       = b_features$norm_feat,
+  "taxonomy_map"   = full_taxonomy
+)
+```
+
+Save
+```{r, eval = FALSE}
+save_output(a_species_data, "meta_A", "data/intermediate")
+save_output(b_species_data, "meta_B", "data/intermediate")
+```

@@ -1,0 +1,211 @@
+---
+title: "vns_genera_barplots.Rmd"
+author: "Alyssa N. Easton"
+date: '2025-09-05'
+output: html_document
+---
+
+# Preprocessing Thome files to combine
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache=TRUE)
+knitr::opts_knit$set(root.dir = file.path(Sys.getenv("VNS_ROOT"), "data"))  # stored VNS_ROOT in ~/.Renviron
+options(digits = 10) ## Formats output to 10 digits
+library(tidyverse)
+library(forcats)
+library(tibble)
+library(data.table)
+library(magrittr)
+library(openxlsx)
+library(janitor)
+library(purrr)
+library(broom)
+library(pheatmap)
+library(circlize)
+library(cowplot)
+library(ggpubr)
+library(ComplexHeatmap)
+library(svglite)
+source("/proj/gibbons/2024_easton_vns/scripts/june_functions.R")
+source("/proj/gibbons/2024_easton_vns/scripts/shannon_div_functions.R")
+
+```
+
+Data
+```{r}
+micro <- readRDS("/proj/gibbons/2024_easton_vns/data/1_preprocessed/species_october.rds")
+
+a_relabund <- micro$all_abund %>% filter(seq_name %in% micro$a_meta$seq_name) %>%
+  dplyr::select(where(~ !all(is.na(.)))) # %>%
+  # mutate(across(everything(), ~replace_na(., 0)))
+  
+b_relabund <- micro$all_abund %>% filter(seq_name %in% micro$b_meta$seq_name) %>%
+  dplyr::select(where(~ !all(is.na(.)))) # %>%
+  # mutate(across(everything(), ~replace_na(., 0)))
+
+
+# micro <- readRDS("/proj/gibbons/2024_easton_vns/data/1_preprocessed/microbe_ncbi.rds")
+# species_counts <- micro$metaphlan_100 %>% mutate(seq_name = as.numeric(seq_name))        # now rel_abund
+# taxa_map       <- micro$metaphlan_tax_100_map
+# taxa_cols      <- colnames(species_counts) %>% setdiff("seq_name")
+# merged         <- readRDS("/proj/gibbons/2024_easton_vns/data/1_preprocessed/meta_outcomePC_all.rds")
+# merged_clr     <- clr.return.presence(data = merged,
+#                                   taxa_cols = taxa_cols,
+#                                   id_col = "seq_name")
+```
+
+```{r}
+# a <- merged %>%
+#   filter(cohort == "A") %>%
+#   arrange(inj_trt_group, Round_main)
+# 
+# b <- merged %>%
+#   filter(cohort == "B") %>%
+#   arrange(inj_trt_group, Round_main)
+# 
+# four_colors <- c(
+#   "Sham + Sham" = "#1032ff",
+#   "Sham + VNS" = "#00fdff",
+#   "Blast + Sham" = "#ff9200",
+#   "Blast + VNS" = "#942493"
+#   )
+```
+
+# sort by `inj_trt_group`, *then* by `Round_main` (so we'll sort of see batch effects)
+```{r}
+get.plot.data <- function(meta, rel_abund) {
+  # arrange in order of Group, then batch, then cage.
+  meta <- meta %>%
+    arrange(inj_trt_group, Round_main, Cage) %>%
+    mutate(seq_name = as.character(seq_name)) %>%
+    inner_join(rel_abund, by = "seq_name") %>%
+    mutate(
+      inj_trt_group = fct_relevel(inj_trt_group, "Sham + Sham", "Blast + Sham", "Sham + VNS", "Blast + VNS")
+    )
+  
+  taxa_cols <- colnames(rel_abund) %>% setdiff("seq_name")
+  
+  # meta$unclassified <- 100 - (
+  #   meta %>%
+  #     dplyr::select(all_of(taxa_cols)) %>%
+  #     rowSums()
+  #   )
+  # 
+  # taxa_cols <- c(taxa_cols, "unclassified")
+  
+  # pivot to long format, where "Feature" is a column that contains the species
+  long_df <- meta %>%
+    pivot_longer(
+      cols = all_of(taxa_cols),
+      names_to = "Species",
+      values_to = "Abundance"
+    )
+  
+  # get the top species
+  top_features <- long_df %>%
+    group_by(Species) %>%
+    summarise(total_abundance = sum(Abundance, na.rm = TRUE)) %>%
+    filter(Species != "unclassified") %>%
+    slice_max(total_abundance, n = 10) %>%
+    pull(Species)
+  
+  long_df <- long_df %>%
+    mutate(
+      Species = ifelse(Species %in% top_features, Species, "Other")
+    ) %>%
+    group_by(seq_name, Species) %>%   # Group by sample and species
+    mutate(Abundance = sum(Abundance, na.rm = TRUE)) %>%  # Sum abundance
+    ungroup() %>%
+    distinct() %>%
+    mutate(
+      Species = fct_reorder(Species, Abundance, .fun = sum, .desc = TRUE),
+      Species = fct_relevel(Species, "Other", after = 0)
+      )
+  
+  return(long_df)
+}
+
+```
+
+```{r}
+plot_df_a <- get.plot.data(meta = micro$a_meta, rel_abund = a_relabund)
+plot_df_b <- get.plot.data(meta = micro$b_meta, rel_abund = b_relabund)
+```
+
+Don't need to replot, but could change order of groups here
+```{r}
+plot_a <- ggplot(plot_df_a, aes(x = as.character(seq_name), y = Abundance, fill = Species)) +
+  geom_bar(stat = "identity") +
+  facet_grid(~inj_trt_group, scales = "free_x", space = "free") +  # groups samples visually by Group
+  theme_classic() +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+        axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+        axis.line.y = element_blank()) +
+  labs(x = "Sample", y = "Relative Abundance", fill = "Species") +
+  scale_fill_manual(values = palette_16)
+  # scale_fill_manual(values = new_palette)
+plot_a
+# ggsave("../figures/species_barplot_a.svg", plot_a, height = 3, width = 5, device = "svg")
+```
+
+Experimented with different orders, but decided the first one was the best
+```{r}
+plot_b <- ggplot(plot_df_b, aes(x = as.character(seq_name), y = Abundance, fill = Species)) +
+  geom_bar(stat = "identity") +
+  facet_grid(~inj_trt_group, scales = "free_x", space = "free") +  # groups samples visually by Group
+  theme_classic() +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+        axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+        axis.line.y = element_blank()) +
+  labs(x = "Sample", y = "Relative Abundance", fill = "Species") +
+  scale_fill_manual(values = palette_16)
+  # scale_fill_manual(values = new_palette)
+plot_b
+# ggsave("../figures/species_barplot_b.svg", plot_b, height = 4, width = 6, device = "svg")
+```
+
+
+# Old code + trying different colors
+```{r}
+all_taxa <- unique(c(plot_df_a$Species, plot_df_b$Species)) # this is what I used to develop a consistent palette
+all_taxa
+```
+
+7d0225
+CAADFF light purple
+"#4CBB17", # Kelly green
+"#E69F00", # orange
+"#6A3D9A", # dark purple
+"#EC5F6B", # watermelon"
+
+
+order_a <- c(
+  "Other", "Muribaculaceae_bacterium", "GGB46159_SGB63927", "GGB70852_SGB95305",
+  "Dubosiella_newyorkensis", "Lactobacillus_johnsonii", "GGB27878_SGB40312",
+  "Akkermansia_muciniphila", "Lachnospiraceae_bacterium",
+  "Bacteroides_thetaiotaomicron", "GGB1515_SGB2095"
+)
+
+order_b <- c(
+  "Other", "GGB27876_SGB40310", "Dubosiella_newyorkensis", "Lactobacillus_johnsonii",
+  "Muribaculaceae_bacterium", "Alistipes_sp_DSM_112343", "GGB27918_SGB40356",
+  "GGB27878_SGB40312", "Bifidobacterium_pseudolongum", "Akkermansia_muciniphila",
+  "Turicibacter_sp_1E2"
+)
+
+
+plot_df_a <- plot_df_a %>%        # Set factor levels in your plotting data
+  mutate(Species = factor(Species, levels = order_a)) %>%
+  arrange()
+
+plot_df_b <- plot_df_b %>%
+  mutate(Species = factor(Species, levels = order_b))
+
+order_b <- c(
+  "Other", "Dubosiella_newyorkensis", "GGB27876_SGB40310", "Muribaculaceae_bacterium",
+  "Lactobacillus_johnsonii", "GGB27918_SGB40356", "Alistipes_sp_DSM_112343",
+  "GGB27878_SGB40312", "Bifidobacterium_pseudolongum", "Akkermansia_muciniphila",
+  "Turicibacter_sp_1E2"
+)
+plot_df_b <- plot_df_b %>%
+  mutate(Species = factor(Species, levels = order_b))

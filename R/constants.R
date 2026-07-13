@@ -10,3 +10,7 @@ extra_B_cols <- c(
   "EtOH_pref_24h_6", "EtOH_pref_24h_7", "EtOH_pref_24h_8", "EtOH_pref_24h_9", "EtOH_pref_24h_10", "EtOH_pref_24h_11", "EtOH_pref_24h_12",
   "EtOH_24h", "EtOH_pref_24h", "EtOH_8pm"
 )
+
+seeds <- list(
+  rarefy = 145
+)

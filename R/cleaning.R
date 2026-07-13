@@ -1,4 +1,20 @@
 ########################  clean vectors of names  ########################
+clean_vec <- function(name_vec) {
+  tmp_df <- data.frame(matrix(NA, nrow=5, ncol=length(name_vec)))
+  colnames(tmp_df) <- name_vec
+  tmp_df_clean <- clean_names(tmp_df, case = "none")
+  colnames(tmp_df_clean)
+}
+
+clean_meta <- function(meta) {
+  meta %>%
+    mutate(Round_main    = droplevels(Round_main)) %>%
+    dplyr::select(where(~ !all(is.na(.)))) %>%  # same as meta <- meta[, colSums(is.na(meta)) != nrow(meta)]
+    relocate(c("cohort", "inj_trt_group"), .before = 3) %>%
+    relocate(c("animal_code", "seq_name"), .before = 1) %>%
+    dplyr::select(-c("cohort", "file_name", "feces_tp"))
+}
+
 clean_bug_names <- function(name_vector) {
   clean_vector <- name_vector %>%
     gsub(" sp\\. ", "_sp_", .) %>%

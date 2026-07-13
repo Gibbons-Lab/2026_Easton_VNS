@@ -1,12 +1,19 @@
 ---
-title: "alphadiv_final.Rmd"
+title: "02_diversity.Rmd"
 author: "Alyssa N. Easton"
 date: '2025-09-29'
 output: 
 ---
 
-Originally `shannon_div.Rmd`, but had to re-run MetaPhlAn to get estimated counts,
-as n_reads was associated with Shannon diversity.
+## Inputs
+- `data/intermediate/01_meta_A.rds`
+- `data/intermediate/01_meta_B.rds`
+
+## Outputs
+- 
+
+Had to re-run MetaPhlAn to get estimated counts and rarefy counts myself,
+as originally raw (non-rarefied) n_reads was associated with Shannon diversity.
 
 Questions:
 1. Across the metadata, what is associated with alpha diversity?
@@ -15,8 +22,9 @@ Questions:
 
 ## Setup
 ```{r "setup", include=FALSE}
+source(here::here("R", "paths.R"))
 knitr::opts_chunk$set(echo = TRUE, cache=TRUE)
-knitr::opts_knit$set(root.dir = file.path(Sys.getenv("VNS_ROOT"), "data"))  # stored VNS_ROOT in ~/.Renviron 
+knitr::opts_knit$set(root.dir = PROJECT_ROOT)
 options(digits = 10) ## Formats output to 10 digits
 library(tidyverse)
 library(data.table)
@@ -33,354 +41,17 @@ library(openxlsx)
 library(zCompositions)
 library(compositions)
 library(nortest)
-source("/proj/gibbons/2024_easton_vns/scripts/shannon_div_functions.R")
-
+source(here::here("R", "utils.R"))
+source(here::here("R", "cleaning.R"))
+source(here::here("R", "microbiome_preprocess.R"))
+source(here::here("R", "diversity_utils.R"))
 ```
 
-## Import metadata
+## Imports
 ```{r}
-# sort by sequencing id
-metadata <- readRDS("1_preprocessed/metadata.rds") %>%
-  relocate(seq_name, .before = 6) %>%
-  arrange(seq_name)
-
-seq_a <- metadata %>% filter(cohort == "A") %>% pull(seq_name)
-seq_b <- metadata %>% filter(cohort == "B") %>% pull(seq_name)
-
-# species-level count table
-
-# take a random sub-sample of X counts (find lowest total counts/sample)
-
-# calculate Shannon diversity, species observed, and another dominance metric
+a_data <- readRDS(here::here("data", "intermediate", "01_meta_A.rds"))
+b_data <- readRDS(here::here("data", "intermediate", "01_meta_B.rds"))
 ```
-
-# Process Microbiome data
-## Import + Preprocess Taxonomic Counts
-Preprocess new MetaPhlAn output myself - get *species-level count table*
-```{r}
-files <- list.files("/proj/gibbons/2024_easton_vns/metaphlan_2/metaphlan", 
-                    pattern = "_metaphlan\\.txt$", full.names = TRUE)
-
-dt <- rbindlist(lapply(files, function(f) {
-  fread(f)[, seq_name := sub("_metaphlan\\.txt$", "", basename(f))]
-}), fill = TRUE) %>%
-  rename(
-    clade_name = `#clade_name`,
-    est_n_reads = estimated_number_of_reads_from_the_clade
-    ) %>%
-  filter(seq_name %in% metadata$seq_name)
-
-s_long <- dt %>%                 # we can do this for any taxonomic level
-  filter(
-    grepl("\\|s__", clade_name) | clade_name == "UNCLASSIFIED",
-    !grepl("\\|t__", clade_name)
-  ) %>%
-  mutate(
-    clade_name = ifelse(
-      clade_name == "UNCLASSIFIED",
-      "k__unclassified|p__unclassified|c__unclassified|o__unclassified|f__unclassified|g__unclassified|s__unclassified",
-      clade_name
-      )
-  )
-
-full_taxonomy <- data.frame(full_name = unique(s_long$clade_name)) %>%
-  separate(
-    full_name,
-    sep = "\\|",
-    into = c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species"), # no "Strain"
-    fill = "right",
-    remove = FALSE
-  ) %>%
-  mutate(
-    Kingdom = gsub("k__", "", Kingdom),
-    Phylum  = gsub("p__", "", Phylum),
-    Class   = gsub("c__", "", Class),
-    Order   = gsub("o__", "", Order),
-    Family  = gsub("f__", "", Family),
-    Genus   = gsub("g__", "", Genus),
-    Species = gsub("s__", "", Species)
-  )
-
-# check that all species names are still unique
-length(unique(full_taxonomy$Species)) == length(unique(full_taxonomy$full_name))
-
-s_long <- s_long %>%
-  left_join(
-    full_taxonomy %>%
-      dplyr::select(full_name, Species),
-    by = c("clade_name" = "full_name")
-    ) %>%
-  mutate(
-    clade_name = coalesce(Species, clade_name)
-    ) %>%
-  dplyr::select(-Species)
-
-s_counts <- s_long %>%
-  pivot_wider(
-    ., id_cols = "seq_name", names_from = "clade_name", values_from = "est_n_reads"
-    ) %>%
-  dplyr::select(-unclassified)   # remove because some values are negative
-
-s_relabund <- s_long %>%
-  pivot_wider(., id_cols = "seq_name", names_from = "clade_name", values_from = "relative_abundance")
-
-```
-
-Rarefy count table to lowest n_reads (for each cohort)
-  cohort A worst depth is sample *1413* (575,229 reads), followed by *1419*
-  cohort B worst depth is sample *1766* (154,195 reads), followed by *1765* <- keep an eye on this 1766 - might need to drop?
-```{r}
-counts_both <- s_counts %>%
-  filter(seq_name %in% c(seq_a, seq_b)) %>%
-  dplyr::select(where(~ !all(is.na(.)))) %>%
-  mutate(across(everything(), ~replace_na(., 0))) %>%
-  column_to_rownames("seq_name")
-
-counts_a <- s_counts %>%
-  filter(seq_name %in% seq_a) %>%
-  dplyr::select(where(~ !all(is.na(.)))) %>%
-  mutate(across(everything(), ~replace_na(., 0))) %>%
-  column_to_rownames("seq_name")
-
-counts_b <- s_counts %>%
-  filter(seq_name %in% seq_b) %>%
-  dplyr::select(where(~ !all(is.na(.)))) %>%
-  mutate(across(everything(), ~replace_na(., 0))) %>%
-  column_to_rownames("seq_name")
-
-# also just go ahead and separate the relative abundance into a and b
-relabund_a <- s_relabund %>%
-  filter(seq_name %in% seq_a) %>%
-  dplyr::select(where(~ !all(is.na(.))))
-relabund_b <- s_relabund %>%
-  filter(seq_name %in% seq_b) %>%
-  dplyr::select(where(~ !all(is.na(.))))
-```
-
-## Do rarefaction by hand
-(this uses my own function `rarefy`, which is in `shannon_div_functions.R`)
-```{r}
-set.seed(145)
-raref_both <- rarefy(counts_both)  # 256 species
-raref_a <- rarefy(counts_a)        # 214 species
-raref_b <- rarefy(counts_b)        # 231 species
-```
-
-Just curious about presence after rarefying
-```{r}
-presence_a <- return.presence(raref_a, colnames(raref_a))
-presence_b <- return.presence(raref_b, colnames(raref_b))
-presence_both <- return.presence(raref_both, colnames(raref_both))
-
-hist(presence_a)
-hist(presence_b)
-hist(presence_both)
-```
-
-
-## Clean metadata
-```{r}
-
-clean_meta <- function(meta) {
-  meta %>%
-    mutate(
-      Round_main    = droplevels(Round_main),
-      blast         = ifelse(Injury    == "Blast",                   1, 0),
-      vns           = ifelse(Treatment == "VNS",                     1, 0),
-      blast_and_vns = ifelse(Injury == "Blast" & Treatment == "VNS", 1, 0),
-      seq_name      = as.character(seq_name),
-      inj_trt_group = fct_relevel(
-        inj_trt_group, "Sham + Sham", "Blast + Sham", "Sham + VNS", "Blast + VNS"
-        )
-      ) %>%
-    dplyr::select(where(~ !all(is.na(.)))) %>%  # same as meta <- meta[, colSums(is.na(meta)) != nrow(meta)]
-    relocate(c("cohort", "inj_trt_group"), .before = 3) %>%
-    relocate(c("animal_code", "seq_name"), .before = 1) %>%
-    dplyr::select(-c("cohort", "file_name", "feces_tp"))
-}
-
-meta_a <- clean_meta(filter(metadata, cohort == "A"))
-meta_b <- clean_meta(filter(metadata, cohort == "B"))
-
-meta_b_smaller <- meta_b %>%
-  dplyr::select(-c(
-    LORR_1, LORR_2, LORR_3,
-    ppi_mV_max_2, ppi_mV_max_10, ppi_mV_max_20, ppi_mV_max_50, ppi_mV_max_100, ppi_mV_max_200, ppi_mV_max_500, ppi_mV_max_1000,
-    PD_0perc, PD_25perc, PD_50perc, PD_75perc, PD_100perc,
-    PD_0RHElate, PD_25RHElate, PD_50RHElate, PD_75RHElate, PD_100RHElate,
-    PD_0HEITI, PD_25HEITI, PD_50HEITI, PD_75HEITI, PD_100HEITI,
-    EtOH_24h_1, EtOH_24h_2, EtOH_24h_3, EtOH_24h_4, EtOH_24h_5, EtOH_24h_6, EtOH_24h_7, EtOH_24h_8, EtOH_24h_9, EtOH_24h_10,
-    EtOH_24h_11, EtOH_24h_12, EtOH_pref_24h_1, EtOH_pref_24h_2, EtOH_pref_24h_3, EtOH_pref_24h_4, EtOH_pref_24h_5,
-    EtOH_pref_24h_6, EtOH_pref_24h_7, EtOH_pref_24h_8, EtOH_pref_24h_9, EtOH_pref_24h_10, EtOH_pref_24h_11, EtOH_pref_24h_12,
-    EtOH_24h, EtOH_pref_24h, EtOH_8pm
-  ))
-```
-
-# Tried filtering before CLR transform - it didn't change much
-Maybe I should CLR-transform here just for the sake of it... ?
-```{r}
-# thresh    <- 0.25
-# 
-# counts    <- counts_a
-# pres      <- counts > 0
-# pct_pres  <- colSums(pres) / nrow(pres)
-# good_taxa <- names(pct_pres)[pct_pres >= thresh] # 138 "good" taxa
-# filt_counts  <- counts[, good_taxa]
-# cm           <- cmultRepl(filt_counts, label = 0, method = "CZM", z.delete = FALSE)   # or method="GBM"
-# clr_mat      <- t(apply(cm, 1, compositions::clr))
-# 
-# clr.transform <- function(count_mat, thresh = 0.25, method = "CZM") {
-#   pres         <- count_mat > 0
-#   pct_pres     <- colSums(pres) / nrow(pres)
-#   good_taxa    <- names(pct_pres)[pct_pres >= thresh] # 138 "good" taxa
-#   filt_counts  <- count_mat[, good_taxa]
-#   cm           <- cmultRepl(filt_counts, label = 0, method = method, z.delete = FALSE)   # or method="GBM"
-#   clr_mat      <- t(apply(cm, 1, compositions::clr))
-#   return(clr_mat)
-# }
-# 
-# # how many do these samples have ? they have some info but not much for whatever reason ...
-# filt_counts["1366", filt_counts["1366", ] != 0]  # only 19 taxa observed/annotated
-# filt_counts["1419", filt_counts["1419", ] != 0]  # only 26 taxa observed/annotated
-```
-
-## Try doing CLR + multiplicative replacement 
-
-```{r}
-# find_best_threshold <- function(count_mat, thresholds = seq(0.1, 0.5, by = 0.05),
-#                                 methods = c("CZM", "GBM")) {
-#   
-#   results <- lapply(thresholds, function(thresh) {
-#     pres         <- count_mat > 0
-#     pct_pres     <- colSums(pres) / nrow(pres)
-#     good_taxa    <- names(pct_pres)[pct_pres >= thresh]
-#     if (length(good_taxa) < 2) return(NULL)  # skip if too few taxa
-#     
-#     filt_counts  <- count_mat[, good_taxa, drop = FALSE]
-#     
-#     method_results <- lapply(methods, function(m) {
-#       cm <- cmultRepl(filt_counts, label = 0, method = m, z.delete = FALSE)
-#       clr_mat <- t(apply(cm, 1, clr))
-#       
-#       # ---- per-feature AD tests ----
-#       ad_stats <- apply(clr_mat, 2, function(feature_vals) {
-#         # AD test on this taxon's clr distribution across samples
-#         test <- tryCatch(ad.test(feature_vals), error = function(e) NULL)
-#         if (is.null(test)) return(NA)
-#         test$statistic
-#       })
-#       
-#       # average statistic across taxa
-#       mean_ad <- mean(ad_stats, na.rm = TRUE)
-#       
-#       data.frame(
-#         threshold = thresh,
-#         method = m,
-#         n_taxa = ncol(clr_mat),
-#         mean_ad_stat = mean_ad
-#       )
-#     })
-#     
-#     do.call(rbind, method_results)
-#   })
-#   
-#   out <- do.call(rbind, results)
-#   
-#   # best threshold per method = lowest average AD statistic
-#   best <- out %>%
-#     group_by(method) %>%
-#     slice_min(mean_ad_stat, n = 1, with_ties = FALSE) %>%
-#     ungroup()
-#   
-#   list(results = out, best = best)
-# }
-# 
-# # Example usage:
-# res_a <- find_best_threshold(
-#   counts_a,
-#   thresholds = seq(0.1, 0.5, by = 0.05),
-#   methods = c("CZM", "GBM")
-#   )
-# 
-# res_b <- find_best_threshold(
-#   counts_b,
-#   thresholds = seq(0.1, 0.5, by = 0.05),
-#   methods = c("CZM", "GBM")
-# )
-# 
-# res_a$best
-# res_b$best
-```
-
-```{r}
-# clr_a <- clr.transform(counts_a, thresh = 0.25, method = "GBM")
-# clr_b <- clr.transform(counts_b, thresh = 0.20, method = "GBM")
-# 
-# # Look through AD stats just because I'm curious for clr B
-# ad_stats <- apply(clr_b, 2, function(feature_vals) {
-#   # AD test on this taxon's clr distribution across samples
-#   test <- tryCatch(ad.test(feature_vals), error = function(e) NULL)
-#   if (is.null(test)) return(NA)
-#   test$statistic
-# })
-# 
-# # look at one of the worst ones (AD = 4.36)
-# hist(clr_b[, "Adlercreutzia_mucosicola"])
-# hist(clr_b[, "GGB31822_SGB45198"]) # this is the very worst (AD = 5.5)
-```
-meh, not horrible ...
-# Redo clr the way I did it originallly (filtering afterwards)
-```{r}
-clr.transform <- function(relab, thresh = 0.25) {
-  relab    <- relab %>%   # already has zero cols removed
-    column_to_rownames("seq_name") %>%
-    mutate(across(everything(), ~replace_na(., 0)/100))
-  pres      <- relab > 0
-  pct_pres  <- colSums(pres) / nrow(pres)
-  good_taxa <- names(pct_pres)[pct_pres >= thresh]
-  relab     <- relab + 1e-8                        # add a pseudocount
-  clr_mat   <- relab %>%
-    apply(1, function(row) {
-      log(row / exp(mean(log(row))))
-    }) %>%
-    t() %>%
-    as.data.frame() %>%
-    setNames(colnames(relab))
-  clr_filt <- clr_mat[, good_taxa]
-  return(clr_filt)
-}
-
-clr_a <- clr.transform(relabund_a, 0.25)
-clr_b <- clr.transform(relabund_b, 0.25)
-```
-
-
-
-# Export some of this preprocessed data
-```{r}
-species_processed <- list(
-  # main outputs for A
-  a_counts      = counts_a,
-  a_counts_rare = raref_a,
-  a_meta        = meta_a,
-  a_relabund    = relabund_a,
-  a_clr         = clr_a,
-  # main outputs for B
-  b_counts      = counts_b,
-  b_counts_rare = raref_b,
-  b_meta        = meta_b_smaller,
-  b_relabund    = relabund_b,
-  b_clr         = clr_b,
-  # other useful info
-  taxonomy_map  = full_taxonomy,
-  all_counts    = s_counts,
-  all_abund     = s_relabund,
-  all_raref     = raref_both
-)
-
-saveRDS(species_processed, "/proj/gibbons/2024_easton_vns/data/1_preprocessed/species_october.rds")
-```
-
 
 
 # Alpha Diversity
