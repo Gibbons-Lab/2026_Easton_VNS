@@ -10,7 +10,8 @@ output:
 - `data/intermediate/01_meta_B.rds`
 
 ## Outputs
-- 
+- `results/RDS/02_diversity_A.rds`
+- `results/RDS/02_diversity_B.rds`
 
 Had to re-run MetaPhlAn to get estimated counts and rarefy counts myself,
 as originally raw (non-rarefied) n_reads was associated with Shannon diversity.
@@ -20,452 +21,316 @@ Questions:
 2. Does treatment affect alpha diversity?
 3. Is treatment's effect on alpha diversity confounded by any variables (batch, weight)?
 
-## Setup
 ```{r "setup", include=FALSE}
-source(here::here("R", "paths.R"))
+source("/proj/gibbons/2026_easton_vns/R/paths.R")
+
 knitr::opts_chunk$set(echo = TRUE, cache=TRUE)
 knitr::opts_knit$set(root.dir = PROJECT_ROOT)
-options(digits = 10) ## Formats output to 10 digits
+
+options(digits = 10)
+
 library(tidyverse)
-library(data.table)
-library(magrittr)
-library(patchwork)
-library(stats)
-library(ggsignif)
-library(lme4)
-library(viridis)
-library(pheatmap)
-library(broom)
-library(janitor)
 library(openxlsx)
-library(zCompositions)
-library(compositions)
-library(nortest)
-source(here::here("R", "utils.R"))
-source(here::here("R", "cleaning.R"))
-source(here::here("R", "microbiome_preprocess.R"))
-source(here::here("R", "diversity_utils.R"))
+library(janitor)
+library(ggtext)       # wrapper function plot_multiple_dv uses all of these
+library(broom)
+library(broom.helpers)
+library(emmeans)
+library(ggpubr)
+library(cowplot)
+library(grid)
+library(gridExtra)
+library(gtable)
+library(vegan)
+
+source(file.path(PROJECT_ROOT, "R", "utils.R"))
+source(file.path(PROJECT_ROOT, "R", "cleaning.R"))
+source(file.path(PROJECT_ROOT, "R", "microbiome_preprocess.R"))
+source(file.path(PROJECT_ROOT, "R", "diversity_utils.R"))
+source(file.path(PROJECT_ROOT, "R", "plotting_utils.R")) # needs ggtext
+source(file.path(PROJECT_ROOT, "R", "palettes.R"))
+# source(file.path(PROJECT_ROOT, "R", "constants.R"))
+# source(file.path(PROJECT_ROOT, "R", "pca_utils.R"))
 ```
 
 ## Imports
 ```{r}
-a_data <- readRDS(here::here("data", "intermediate", "01_meta_A.rds"))
-b_data <- readRDS(here::here("data", "intermediate", "01_meta_B.rds"))
+a_data <- readRDS(file.path(PROJECT_ROOT, "data", "intermediate", "01_meta_A.rds"))
+b_data <- readRDS(file.path(PROJECT_ROOT, "data", "intermediate", "01_meta_B.rds"))
 ```
 
+Merge diversity metrics with metadata
+ - Shannon Index (richness + evenness)
+ - Berger-Parker Dominance
+ - Observed features (richness)
+```{r}
+div_cols <- c("shannon", "richness", "berger_parker")
+
+a_df <- a_data$clr_alpha %>%
+  dplyr::select(all_of(c("seq_name", div_cols))) %>%
+  left_join(a_data$meta, by = "seq_name")
+
+b_df <- b_data$clr_alpha %>%
+  dplyr::select(all_of(c("seq_name", div_cols))) %>%
+  left_join(b_data$meta, by = "seq_name")
+```
 
 # Alpha Diversity
-## Calculate per-sample Alpha Diversity indices:
-    *Shannon Index (richness + evenness), Berger-Parker Dominance, Observed features (richness)*
+### Box Plots
 ```{r}
-alpha_div <- function(raref_counts) {
-  shannon    <- vegan::diversity(raref_counts, index = "shannon", MARGIN = 1) # row-wise
-  n_feats    <- rowSums(raref_counts >= 1)
-  simpson    <- vegan::diversity(raref_counts, index = "simpson", MARGIN = 1)
-  invsimpson <- vegan::diversity(raref_counts, index = "invsimpson")
-  richness   <- rowSums(raref_counts > 0)
-  pielou     <- shannon / log(richness)
-  berg_park  <- apply(raref_counts, 1, function(x) {
-    max(x) / sum(x)
-  })
-  
-  data.frame(
-    shannon       = shannon,
-    simpson       = simpson,
-    invsimpson    = invsimpson,
-    richness      = richness,
-    pielou        = pielou,
-    berger_parker = berg_park
-  )
-}
+label_df <- data.frame(dv = div_cols) %>%
+  mutate(label = clean_bug_names(div_cols))
 
-
-alph_a <- alpha_div(raref_a)
-alph_b <- alpha_div(raref_b)
-
-alph_a
-alph_b
-
-saveRDS(alph_a, file = "/proj/gibbons/2024_easton_vns/data/diversity/A_alpha.rds")
-saveRDS(alph_b, file = "/proj/gibbons/2024_easton_vns/data/diversity/B_alpha.rds")
-```
-
-## Merge diversity into metadata
-```{r}
-alpha_div_cols <- colnames(alph_a)
-
-merge_a <- meta_a %>%
-  left_join(alph_a %>% rownames_to_column("seq_name"), by = "seq_name") %>%
-  relocate(all_of(alpha_div_cols), .before = 9)
-
-merge_b <- meta_b_smaller %>%
-  left_join(alph_b %>% rownames_to_column("seq_name"), by = "seq_name") %>%
-  relocate(all_of(alpha_div_cols), .before = 9)
-```
-
-Testing function w/ signif bars
-```{r}
-injtrt_pal <- c(
-  "Sham + Sham"  = "#1032ff",
-  "Sham + VNS"   = "#1032ff",
-  "Blast + Sham" = "#ff9200",
-  "Blast + VNS"  = "#ff9200"
-  )
-
-# Manually assign x-positions of boxes
-pos_map <- c(                # custom spacing
-  "Sham + Sham"  = 4/30,
-  "Blast + Sham" = 10/30,
-  "Sham + VNS"   = 20/30,
-  "Blast + VNS"  = 26/30
-  )
-box_wid <- 4/30
-```
-
-```{r}
-# box_easy <- function(
-#     data,
-#     dv,
-#     y_lab,
-#     groups      = "inj_trt_group",
-#     palette     = injtrt_pal,
-#     x_positions = c(4,10,20,26),
-#     box_width   = 4,
-#     axis_length = 30,
-#     show_legend = FALSE
-#     ) {
-#   # --- Rescale positions and widths to proportions ---
-#   pos_map <- x_positions / axis_length
-#   names(pos_map) <- levels(factor(data[[groups]]))  # match group order
-#   box_width <- box_width / axis_length              # rescale width
-#   error_width <- box_width/2
-#   
-#   # assign numeric xpos to each row
-#   data$xpos <- pos_map[as.character(data[[groups]])]
-# 
-#   # calculate base ymax and step for significance bar stacking
-#   dv_vals <- data[[dv]]
-#   base    <- max(dv_vals, na.rm = TRUE)
-#   step    <- 0.2 * diff(range(dv_vals, na.rm = TRUE))  # spacing between bars
-#   y_max   <- base + 4 * step
-#   
-#   ggplot(data, aes(x = xpos, y = .data[[dv]], group = .data[[groups]], fill = .data[[groups]])) +
-#     geom_boxplot(
-#       width    = box_width,
-#       color    = "grey",
-#       fill     = "transparent",
-#       outliers = FALSE,
-#       coef     = 0
-#     ) +
-#     stat_summary(
-#       geom = "errorbar",
-#       fun.data = "mean_cl_boot",
-#       width = error_width
-#     ) +
-#     geom_point(
-#       position = position_jitter(width = box_width/4, height = 0), # jitter relative to box width
-#       shape    = 22,
-#       size     = 5,
-#       aes(fill = .data[[groups]]),
-#       color    = "black",
-#       stroke   = 1.2
-#     ) +
-#     scale_x_continuous(               # x-axis scaling/locations
-#       limits = c(0, 1),
-#       breaks = pos_map,
-#       labels = names(pos_map)
-#     ) +
-#     # scale_y_continuous(
-#     #   limits = c(min(dv_vals, na.rm = TRUE), y_max)
-#     # ) +
-#     scale_fill_manual(values = palette) +
-#     coord_fixed(
-#       ratio = 1,
-#       clip = "off"
-#       ) +
-#     labs(x = NULL, y = y_lab, fill = NULL) +
-#     # geom_signif(
-#     #   comparisons = list(
-#     #     c("Sham + Sham" , "Blast + Sham"),
-#     #     c("Sham + VNS"  , "Blast + VNS"),
-#     #     c("Sham + Sham" , "Sham + VNS"),
-#     #     c("Blast + Sham", "Blast + VNS")
-#     #   ),
-#     #   map_signif_level = FALSE, 
-#     #   annotations      = rep(" ", 4),
-#     #   y_position       = base + c(1,1,2,3) * step,
-#     #   tip_length       = 0.03
-#     # ) +
-#     theme_classic() +
-#     theme(
-#       legend.justification = "left",
-#       legend.direction     = "vertical",
-#       legend.background    = element_blank(),
-#       legend.box.margin    = margin(0, 0, 10, 0),
-#       # plot.margin          = margin(10, 10, 10, 10),
-#       aspect.ratio         = 1, # square plotting area
-#       axis.title.y         = element_text(size = 33.75),
-#       axis.text.x          = element_blank(),                # element_text(size = 20),
-#       axis.text.y          = element_text(size = 30),
-#       axis.ticks.x         = element_blank(),
-#       axis.line            = element_line(colour = "black", linewidth = 1)
-#     ) +
-#     theme(legend.position = if(!show_legend) "none" else "right")
-# }
-
-```
-  
-## Visualize treatment effects across 4 treatment groups
-```{r}
-datasets <- list(
-  A = merge_a,
-  B = merge_b
-  )
-metrics  <- list(
-  shannon       = "Shannon Index",
-  simpson       = "Simpson Index", 
-  invsimpson    = "Inverse Simpson",
-  richness      = "Observed Species",
-  pielou        = "Pielou's Evenness",
-  berger_parker = "Berger-Parker Index"
-  )
-
-walk2(
-  rep(names(datasets), each = length(metrics)),
-  rep(names(metrics), times = length(datasets)),
-  ~ {
-    dset <- datasets[[.x]]
-    metric <- .y
-    y_lab <- metrics[[metric]]
-    
-    p <- box_easy(data = dset, dv = metric, y_lab = y_lab) + ggtitle(.x)
-    ggsave(
-      filename = sprintf("../figures/%s_%s_box.svg", .x, metric),
-      plot = p,
-      width = 5,
-      device = "svg"
+a_bp <- plot_multiple_dv(
+  data = a_df,
+  dvs = div_cols,
+  groups = "inj_trt_group",
+  factorA = "Injury",
+  factorB = "Treatment",
+  x_positions = c(4, 10, 20, 26),
+  axis_length = 30,
+  palette = injtrt_pal,
+  label_df = label_df,
+  italicize = FALSE,
+  ylab_size = 20,
+  show_legend = FALSE,
+  fit_fun = aov,
+  comparison_mode = "reduced",
+  factorA_level_for_factorB = "Blast",
+  return_plots = TRUE
+  ) %>%
+  purrr::map(., ~
+  ggdraw(.x) +
+    draw_grob(
+      make_manual_legend(blast_pal),
+      x = -0.10, y = 1.36,
+      hjust = 0, vjust = 1
     )
-  }
 )
 
+a_bp
 ```
-
-
-    Shannon Diversity
+ 
 ```{r}
-shan_a <- box_easy(
-  data  = merge_a,
-  dv    = "shannon",
-  y_lab = "Shannon Index"
-  ) + ggtitle("A")
-
-shan_b <- box_easy(
-  data  = merge_b,
-  dv    = "shannon",
-  y_lab = "Shannon Index"
-  ) + ggtitle("B")
-
-# ggsave("../figures/AB_shannon_box.png", shan_a + shan_b, width = 11)
-# ggsave("../figures/AB_shannon_box.svg", shan_a + shan_b, width = 11, device = "svg")
-
-ggsave("../figures/A_shannon_box.svg", shan_a, width = 5, device = "svg")
-ggsave("../figures/B_shannon_box.svg", shan_b, width = 5, device = "svg")
-
-```
-Simpson Index
-```{r}
-simp_a <- box_easy(data = merge_a, dv = "simpson", y_lab = "Simpson Index") + ggtitle("A")
-simp_b <- box_easy(data = merge_b, dv = "simpson", y_lab = "Simpson Index") + ggtitle("B")
-
-# ggsave("../figures/AB_simpson_box.png", simp, width = 11)
-# ggsave("../figures/AB_simpson_box.svg", simp, width = 11, device = "svg")
-
-ggsave("../figures/A_simpson_box.svg", simp_a, width = 5, device = "svg")
-ggsave("../figures/B_simpson_box.svg", simp_b, width = 5, device = "svg")
-```
-
-Inverse Simpson
-```{r}
-# isimp_a <- split.boxplot(merge_a, "invsimpson", two_colors, y_lab = "Inverse Simpson") + ggtitle("A")
-# isimp_b <- split.boxplot(merge_b, "invsimpson", two_colors, y_lab = "Inverse Simpson") + ggtitle("B")
-# 
-# isimp_a
-# isimp_b
-# ggsave("../figures/AB_invsimpson_box.png", isimp_a + isimp_b)
-# 
-# isimp_a <- split.barplot(merge_a, "invsimpson", two_colors, y_lab = "Inverse Simpson") + ggtitle("A")
-# isimp_b <- split.barplot(merge_b, "invsimpson", two_colors, y_lab = "Inverse Simpson") + ggtitle("B")
-# ggsave("../figures/AB_invsimpson_bar.png", isimp_a + isimp_b)
-
-isimp <- (box_easy(data = merge_a, dv = "invsimpson", y_lab = "Inverse Simpson") + ggtitle("A")) +
-         (box_easy(data = merge_b, dv = "invsimpson", y_lab = "Inverse Simpson") + ggtitle("B"))
-
-ggsave("../figures/AB_invsimpson_box.png", isimp, width = 11)
-ggsave("../figures/AB_invsimpson_box.svg", isimp, width = 11, device = "svg")
-```
-
-Observed Species
-```{r}
-# rich_a <- split.barplot(merge_a, "richness", two_colors, y_lab = "Observed Species") + ggtitle("A")
-# rich_b <- split.barplot(merge_b, "richness", two_colors, y_lab = "Observed Species") + ggtitle("B")
-# 
-# rich_a
-# rich_b
-# ggsave("../figures/AB_richness_bar.png", rich_a + rich_b)
-
-rich <- (box_easy(data = merge_a, dv = "richness", y_lab = "Observed Species") + ggtitle("A")) +
-        (box_easy(data = merge_b, dv = "richness", y_lab = "Observed Species") + ggtitle("B"))
-
-ggsave("../figures/AB_richness_box.png", rich, width = 11)
-ggsave("../figures/AB_richness_box.svg", rich, width = 11, device = "svg")
-```
-
-Pielou's Evenness
-```{r}
-# even_a <- split.boxplot(merge_a, "pielou", two_colors, y_lab = "Pielou's Evenness") + ggtitle("A")
-# even_b <- split.boxplot(merge_b, "pielou", two_colors, y_lab = "Pielou's Evenness") + ggtitle("B")
-# 
-# even_a
-# even_b
-# ggsave("../figures/AB_pielou_box.png", even_a + even_b)
-
-even <- (box_easy(data = merge_a, dv = "pielou", y_lab = "Pielou's Evenness") + ggtitle("A")) +
-        (box_easy(data = merge_b, dv = "pielou", y_lab = "Pielou's Evenness") + ggtitle("B"))
-
-ggsave("../figures/AB_evenness_box.png", even, width = 11)
-ggsave("../figures/AB_evenness_box.svg", even, width = 11, device = "svg")
-```
-
-Berger-Parker Dominance
-```{r}
-# bpa <- split.barplot(merge_a, "berger_parker", two_colors, y_lab = "Berger-Parker Index") + ggtitle("A")
-# bpb <- split.barplot(merge_b, "berger_parker", two_colors, y_lab = "Berger-Parker Index") + ggtitle("B")
-# 
-# bpa + bpb
-# ggsave("../figures/AB_bergerparker_bar.png", bpa + bpb)
-
-bp <- (box_easy(data = merge_a, dv = "berger_parker", y_lab = "Berger-Parker Index") + ggtitle("A")) +
-      (box_easy(data = merge_b, dv = "berger_parker", y_lab = "Berger-Parker Index") + ggtitle("B"))
-
-ggsave("../figures/AB_bergerparker_box.png", bp, width = 11)
-ggsave("../figures/AB_bergerparker_box.svg", bp, width = 11, device = "svg")
-```
-
-### Test for treatment effects with 2-way ANOVA
-```{r}
-anova_a <- list()
-for (col in alpha_div_cols) {
-  f <- as.formula(paste(col, "~ Injury * Treatment"))
-  anova_a[[col]] <- aov(f, data = merge_a)
-}
-
-anova_b <- list()
-for (col in alpha_div_cols) {
-  f <- as.formula(paste(col, "~ Injury * Treatment"))
-  anova_b[[col]] <- aov(f, data = merge_b)
-}
-
-# get a df for a single ANOVA
-# anova_a_df <- tidy(anova_a[[1]]) %>%
-#   mutate(
-#     across(
-#       c(sumsq, meansq, statistic, p.value),
-#       ~ round(.x, 3))
-#     )
-
-# get df for ALL ANOVAs
-anova_a_df <- map2_dfr(anova_a, names(anova_a), ~ {
-  tidy(.x) %>%
-    mutate(
-      y_variable = .y,
-      across(
-        c(sumsq, meansq, statistic, p.value),
-        ~ round(.x, 3)
-      )
+b_bp <- plot_multiple_dv(
+  data = b_df,
+  dvs = div_cols,
+  groups = "inj_trt_group",
+  factorA = "Injury",
+  factorB = "Treatment",
+  x_positions = c(4, 10, 20, 26),
+  axis_length = 30,
+  palette = injtrt_pal,
+  label_df = label_df,
+  italicize = FALSE,
+  ylab_size = 20,
+  show_legend = FALSE,
+  fit_fun = aov,
+  comparison_mode = "reduced",
+  factorA_level_for_factorB = "Blast",
+  return_plots = TRUE
+  ) %>%
+  purrr::map(., ~
+  ggdraw(.x) +
+    draw_grob(
+      make_manual_legend(blast_pal),
+      x = -0.10, y = 1.36,
+      hjust = 0, vjust = 1
     )
-}) %>%
-  filter(y_variable %in% c("shannon", "richness", "berger_parker"))
+)
 
-anova_b_df <- map2_dfr(anova_b, names(anova_b), ~ {
-  tidy(.x) %>%
-    mutate(
-      y_variable = .y,
-      across(
-        c(sumsq, meansq, statistic, p.value),
-        ~ round(.x, 3)
-      )
-    )
-}) %>%
-  filter(y_variable %in% c("shannon", "richness", "berger_parker"))   # I actually only want these 3
+b_bp
+```
 
-anova_a_df
-anova_b_df
+### 2-way ANOVA
+```{r}
+anova_a <- extract_two_way_anova_table(
+  data = a_df,
+  dvs = div_cols,
+  factorA = "Injury",
+  factorB = "Treatment"
+)
+
+anova_b <- extract_two_way_anova_table(
+  data = b_df,
+  dvs = div_cols,
+  factorA = "Injury",
+  factorB = "Treatment"
+)
+
+anova_a
+anova_b
 ```
 
 Same results as last time for *Shannon Index*. 
   All Alpha diversity measures are significantly ~ Injury in cohort A
   Only Pielou's Evenness ~ Injury in cohort B
 
-post-hoc pairwise comparisons
+# Beta Diversity
+
+`count.betadiv.analyze` is a wrapper function that does several things:
+  - generates a Bray-Curtis dissimilarity matrix
+  - does traditional PCoA using `vegan::wcmdscale`
+  - does conditioned PCoA (corrected for some nuisance variable) using `vegan::capscale`
+  - estimates variance explained per PC
+  - PERMANOVA given formula
+      - by terms
+      - by margin
+  - combines these outputs into a large list
+
 ```{r}
-post_hoc <- function(y_var, data) {
-  f <- as.formula(paste(y_var, "~ inj_trt_group"))
-  tests <- list(
-    `Sham-Sham;Blast-Sham` = t.test(
-      f, data = subset(data, inj_trt_group %in% c("Sham + Sham","Blast + Sham"))
+bc_a <- count.betadiv.analyze(
+  rarefied_counts = a_data$counts_raref,
+  meta_filt    = a_data$meta,
+  id_col       = "seq_name",
+  perm_formula = "Round_main + blast + vns + blast_and_vns",
+  condition    = "Round_main",
+  n_perm       = 999
+)
+
+bc_a$perm_terms
+bc_a$perm_marg
+```
+
+```{r}
+term_perm_a <- bc_a$perm_terms %>%
+  filter(term %in% c("Round_main", "blast", "vns", "blast_and_vns")) %>%
+  transmute(
+    Term = case_when(
+      term == "Round_main"    ~ "Batch",
+      term == "blast"         ~ "Injury",
+      term == "vns"           ~ "Treatment",
+      term == "blast_and_vns" ~ "Interaction"
     ),
-    `Sham-VNS;Blast-VNS` = t.test(
-      f, data = subset(data, inj_trt_group %in% c("Sham + VNS","Blast + VNS"))
+    df = as.character(
+      paste0(df, ", ", resid_df)
     ),
-    `Sham-Sham;Sham-VNS` = t.test(
-      f, data = subset(data, inj_trt_group %in% c("Sham + Sham","Sham + VNS"))
+    p = p.value,
+    R2 = R2
+  ) %>%
+  mutate(Term = factor(Term, levels = c("Interaction", "Injury", "Treatment", "Batch"))) %>%
+  arrange(Term)
+
+term_perm_a
+```
+
+
+```{r}
+bc_b <- count.betadiv.analyze(
+  rarefied_counts = b_data$counts_raref,
+  meta_filt    = b_data$meta,
+  id_col       = "seq_name",
+  perm_formula = "Round_main + blast + vns + blast_and_vns",
+  condition    = "Round_main",
+  n_perm       = 999
+)
+
+bc_b$perm_terms
+bc_b$perm_marg
+```
+
+
+
+```{r}
+bc_b$perm_marg
+resid_df <- bc_b$perm_marg %>% filter(term == "Residual") %>% pull(df)
+
+term_perm_b <- bc_b$perm_term %>%
+  filter(term %in% c("Round_main", "blast", "vns", "blast_and_vns")) %>%
+  transmute(
+    Term = case_when(
+      term == "Round_main"    ~ "Batch",
+      term == "blast"         ~ "Injury",
+      term == "vns"           ~ "Treatment",
+      term == "blast_and_vns" ~ "Interaction"
     ),
-    `Blast-Sham;Blast-VNS` = t.test(
-      f, data = subset(data, inj_trt_group %in% c("Blast + Sham","Blast + VNS"))
-    )
+    df = as.character(
+      paste0(df, ", ", resid_df)
+    ),
+    p = p.value,
+    R2 = R2
+  ) %>%
+  mutate(Term = factor(Term, levels = c("Interaction", "Injury", "Treatment", "Batch"))) %>%
+  arrange(Term)
+
+term_perm_b
+```
+
+### Plot A
+```{r}
+# plot marginal biplot of first 2 PCs
+bc_a$cpcoa_scores <- scores(
+  bc_a$cpcoa, display = "sites", scaling = 1,
+  choices = 1:(bc_a$cpcoa$CCA$rank + bc_a$cpcoa$CA$rank)
+  ) %>% as.data.frame() %>%
+  rownames_to_column("seq_name") %>%
+  left_join(., bc_a$meta_filt %>% dplyr::select(inj_trt_group, seq_name, Treatment), by = "seq_name") %>%
+  rename(Group = inj_trt_group) %>%
+  mutate(Group = factor(Group, levels = c("Sham + Sham", "Blast + Sham", "Sham + VNS", "Blast + VNS")))
+
+biplot_a <- combined.biplot(
+  pc_df = bc_a$cpcoa_scores,
+  prop_var = bc_a$cpcoa_var,
+  x_axis = "MDS1", y_axis = "MDS2",
+  color_var = "Group", color_palette = my_colors,
+  shape_var = "Group", shape_palette = my_shapes,
+  rel_widths = c(4, 1), point_size = 3,
+  legend_text_size = 8
   )
-  raw_p <- sapply(tests, \(x) x$p.value)
-  p.adjust(raw_p, method = "bonferroni")
-}
 
-shan_tests_a <- post_hoc("shannon", merge_a)
-shan_tests_b <- post_hoc("shannon", merge_b)
-rich_tests_a <- post_hoc("richness", merge_a)
-rich_tests_b <- post_hoc("richness", merge_b)
-berg_tests_a <- post_hoc("berger_parker", merge_a)
-berg_tests_b <- post_hoc("berger_parker", merge_b)
-
-a_post_hocs <- data.frame(
-  shannon = shan_tests_a,
-  n_species = rich_tests_a,
-  berger_parker = berg_tests_a
-)
-
-b_post_hocs <- data.frame(
-  shannon = shan_tests_b,
-  n_species = rich_tests_b,
-  berger_parker = berg_tests_b
-)
+biplot_a
 ```
-  
 
-
-# Save tables to excel
-*We have stats in tables* `anova_a_df`, `anova_b_df`, ``
-Let's save them to an excel file
+### Plot B
 ```{r}
-wb <- createWorkbook()
+# plot marginal biplot of first 2 PCs
+bc_b$cpcoa_scores <- scores(
+  bc_b$cpcoa, display = "sites", scaling = 1,
+  choices = 1:(bc_b$cpcoa$CCA$rank + bc_b$cpcoa$CA$rank)
+  ) %>% as.data.frame() %>%
+  rownames_to_column("seq_name") %>%
+  left_join(., bc_b$meta_filt %>% dplyr::select(inj_trt_group, seq_name, Treatment), by = "seq_name") %>%
+  rename(Group = inj_trt_group) %>%
+  mutate(Group = factor(Group, levels = c("Sham + Sham", "Blast + Sham", "Sham + VNS", "Blast + VNS")))
 
-addWorksheet(wb, "A_anova")
-addWorksheet(wb, "A_posthoc")
-addWorksheet(wb, "B_anova")
-addWorksheet(wb, "B_posthoc")
+biplot_b <- combined.biplot(
+  pc_df = bc_b$cpcoa_scores,
+  prop_var = bc_b$cpcoa_var,
+  x_axis = "MDS1", y_axis = "MDS2",
+  color_var = "Group", color_palette = my_colors,
+  shape_var = "Group", shape_palette = my_shapes,
+  rel_widths = c(4, 1), point_size = 3,
+  legend_text_size = 8
+  )
 
-writeData(wb, "A_anova",   anova_a_df)
-writeData(wb, "A_posthoc", a_post_hocs)
-writeData(wb, "B_anova",   anova_b_df)
-writeData(wb, "B_posthoc", b_post_hocs)
-
-saveWorkbook(wb, file = "final/alpha_div_tests.xlsx", overwrite = FALSE)
+biplot_b
 ```
 
+# SAVE
+Let's save the tables as-is now, and save to excel later
+```{r}
+a_results <- list(
+  "alphadiv" = list(
+    "anova_table" = anova_a,
+    "boxplots"     = a_bp
+  ),
+  "betadiv" = list(
+    "permanova_table" = term_perm_a,
+    "pcoa_biplot"     = biplot_a
+  )
+)
+
+b_results <- list(
+  "alphadiv" = list(
+    "anova_table"     = anova_b,
+    "boxplots"        = b_bp
+  ),
+  "betadiv" = list(
+    "permanova_table" = term_perm_b,
+    "pcoa_biplot"     = biplot_b
+  )
+)
+
+save_output(a_results, "diversity_A", "results/RDS")
+save_output(b_results, "diversity_B", "results/RDS")
+```

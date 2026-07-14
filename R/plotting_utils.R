@@ -1110,3 +1110,43 @@ combined.biplot <- function(pc_df, prop_var,
   
   return(final_plot)
 }
+
+extract_two_way_anova_table <- function(data, dvs, factorA, factorB, fit_fun = aov) {
+  one_dv <- function(dv) {
+    d <- data %>%
+      dplyr::filter(!is.na(.data[[dv]])) %>%
+      dplyr::mutate(
+        dplyr::across(dplyr::all_of(c(factorA, factorB)), as.factor)
+      )
+    
+    f <- stats::reformulate(paste0(factorA, "*", factorB), response = dv)
+    fit <- fit_fun(f, data = d)
+    
+    an <- broom::tidy(fit) %>%
+      dplyr::filter(term != "Residuals")
+    
+    get_term <- function(term_name) {
+      row <- an %>% dplyr::filter(term == term_name)
+      if (nrow(row) == 0) {
+        return(tibble::tibble(statistic = NA_real_, p.value = NA_real_))
+      }
+      row %>% dplyr::select(statistic, p.value)
+    }
+    
+    int_term <- paste0(factorA, ":", factorB)
+    a_term <- factorA
+    b_term <- factorB
+    
+    tibble::tibble(
+      dv = dv,
+      interaction_F = get_term(int_term)$statistic[[1]],
+      interaction_p = get_term(int_term)$p.value[[1]],
+      injury_F = get_term(a_term)$statistic[[1]],
+      injury_p = get_term(a_term)$p.value[[1]],
+      treatment_F = get_term(b_term)$statistic[[1]],
+      treatment_p = get_term(b_term)$p.value[[1]]
+    )
+  }
+  
+  purrr::map_dfr(dvs, one_dv)
+}

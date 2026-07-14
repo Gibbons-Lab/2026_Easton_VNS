@@ -18,27 +18,30 @@ Outputs contain processed microbiome data, metadata, cytokine PCA,
 and higher-order taxonomic information for species assignments
 
 ```{r "setup", include=FALSE}
-source(here::here("R", "paths.R"))
+source("/proj/gibbons/2026_easton_vns/R/paths.R")
+
 knitr::opts_chunk$set(echo = TRUE, cache=TRUE)
 knitr::opts_knit$set(root.dir = PROJECT_ROOT)
+
 options(digits = 10)
+
 library(tidyverse)
-library(data.table)
-library(magrittr)
-library(readxl)
+library(openxlsx)
 library(janitor)
-source(here::here("R", "utils.R"))
-source(here::here("R", "cleaning.R"))
-source(here::here("R", "microbiome_preprocess.R"))
-source(here::here("R", "diversity_utils.R"))
-source(here::here("R", "constants.R"))
-source(here::here("R", "pca_utils.R"))
+
+source(file.path(PROJECT_ROOT, "R", "utils.R"))
+source(file.path(PROJECT_ROOT, "R", "cleaning.R"))
+source(file.path(PROJECT_ROOT, "R", "microbiome_preprocess.R"))
+source(file.path(PROJECT_ROOT, "R", "diversity_utils.R"))
+source(file.path(PROJECT_ROOT, "R", "constants.R"))
+source(file.path(PROJECT_ROOT, "R", "pca_utils.R"))
 ```
+
 
 ## Prepare Metadata
 ```{r read}
-# updated behavior data
-pd_data <- read_xlsx(here::here("data", "raw", "VNS_behavior_250314.xlsx")) %>%
+# updated probability discounting and ethanol data
+pd_data <- read.xlsx(file.path(PROJECT_ROOT, "data", "raw", "VNS_behavior_250314.xlsx")) %>%
   dplyr::select(animal_code, startle_habituation, startle_PPI, PD_choice,
                 EtOH_24h_intakeave, EtOH_pref_24h, EtOH_8pm_intakeave) %>%
   rename(PD_choice_filt = PD_choice,
@@ -47,7 +50,7 @@ pd_data <- read_xlsx(here::here("data", "raw", "VNS_behavior_250314.xlsx")) %>%
          EtOH_8pm_intakeave_final = EtOH_8pm_intakeave)
 
 # rest of data
-metadata <- read_xlsx(here::here("data", "raw", "VNS_datafinalpaper_240513.xlsx")) %>%
+metadata <- read.xlsx(file.path(PROJECT_ROOT, "data", "raw", "VNS_datafinalpaper_240513.xlsx")) %>%
   dplyr::select(where(~ any(!is.na(.)))) %>%           # remove empty cols
   mutate(animal_code = as.integer(animal_code)) %>%    # convert animal_code to int
   dplyr::select(-matches("p__|o__")) %>%               # remove old microbiome-related columns
@@ -126,9 +129,10 @@ The resulting object is a list, including
 res_A <- run_pca(meta_a, block = "serum|brain")
 
 # extract PCs explaining ≥ 5% total variance
-ck_pcs <- res_A$vars %>%
-  filter(`Proportion of Variance` >= 0.05) %>%
-  pull(PC)
+ck_pc_df <- res_A$vars %>%
+  filter(`Proportion of Variance` >= 0.05)
+  
+ck_pcs <- ck_pc_df %>% pull(PC)
 
 pca_loadings <- res_A$loadings %>%
   dplyr::select(any_of(c("Feature", ck_pcs)))
@@ -145,7 +149,7 @@ meta_a_withPCs <- meta_a %>%
 ### Extract species-level counts
 Process MetaPhlAn output into *species-level count table*
 ```{r}
-files <- list.files("/proj/gibbons/2024_easton_vns/metaphlan_2/metaphlan", 
+files <- list.files(file.path(PROJECT_ROOT, "data", "raw",  "metaphlan"),
                     pattern = "_metaphlan\\.txt$", full.names = TRUE)
 
 dt <- rbindlist(lapply(files, function(f) {
@@ -249,19 +253,20 @@ relabund_b <- s_relabund %>%
 for calculation of alpha and beta diversity metrics
 ```{r}
 set.seed(seeds$rarefy)
-raref_both <- rarefy(counts_both)  # 256 species
+
 raref_a <- rarefy(counts_a)        # 214 species
 raref_b <- rarefy(counts_b)        # 231 species
+# raref_both <- rarefy(counts_both)  # 256 species
 
 
 # curious about presence after rarefying
 presence_a <- return.presence(raref_a, colnames(raref_a))
 presence_b <- return.presence(raref_b, colnames(raref_b))
-presence_both <- return.presence(raref_both, colnames(raref_both))
+# presence_both <- return.presence(raref_both, colnames(raref_both))
 
 hist(presence_a)
 hist(presence_b)
-hist(presence_both)
+# hist(presence_both)
 ```
 
 
@@ -315,6 +320,25 @@ a_bug_infos$info_df <- a_bug_infos$presence_df %>%
     pres_batch1 = `1`,
     pres_batch3 = `3`
   )
+
+# do CLR
+a_clr <- filter_and_clr(
+  bug_info = a_bug_infos$info_df,
+  counts = counts_a,
+  total_presence = 0.3,
+  batch_presence = 0.1,
+  batch_mode = "all_batches",
+  impute_method = "GBM",
+  filt_before_clr = TRUE,
+  scale_clr = FALSE
+)
+
+a_features <- join_bugs_and_div(
+  raw_clr_df = a_clr$clr_df_raw,
+  raw_alpha_df = alph_a
+)
+
+a_features
 ```
 
 ```{r}
@@ -355,35 +379,7 @@ b_bug_infos$info_df <- b_bug_infos$presence_df %>%
     pres_batch9 = `9`
   )
 
-b_bug_infos$info_df
-```
-
-### Do CLR
-```{r}
-a_clr <- filter_and_clr(
-  bug_info = a_bug_infos$info_df,
-  counts = counts_a,
-  total_presence = 0.3,
-  batch_presence = 0.1,
-  batch_mode = "all_batches",
-  impute_method = "GBM",
-  filt_before_clr = TRUE,
-  scale_clr = FALSE
-)
-
-a_features <- join_bugs_and_div(
-  raw_clr_df = a_clr$clr_df_raw,
-  raw_alpha_df = alph_a
-)
-
-a_features
-```
-
-
-  
-`a_features` is now very similar to `"../data/processed/A_clr_df_withalpha_0206.rds"`, except it doesn't have metadata or cytokine PCs yet.
-
-```{r}
+# do CLR
 b_clr <- filter_and_clr(
   bug_info = b_bug_infos$info_df,
   counts = counts_b,
@@ -434,6 +430,7 @@ b_species_data <- list(
   "taxonomy_map"   = full_taxonomy
 )
 ```
+
 
 Save
 ```{r, eval = FALSE}
